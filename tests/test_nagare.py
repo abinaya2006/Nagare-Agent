@@ -5,7 +5,12 @@ import pytest
 from pydantic import ValidationError
 
 from demo.nagare.flow import build_flow
-from demo.nagare.planner import baseline_schedule, candidate_slots, reschedule_task
+from demo.nagare.planner import (
+    baseline_schedule,
+    candidate_slots,
+    fragment_task,
+    reschedule_task,
+)
 from demo.nagare.schema import (
     CircadianProfile,
     ProposedSchedule,
@@ -15,7 +20,7 @@ from demo.nagare.schema import (
     UserScheduleProfile,
 )
 from demo.nagare.validator import validate_schedule
-from slice import runner
+from slice import callback, runner
 from slice.config import Settings
 from slice.records import RunState
 from slice.store import Store
@@ -281,3 +286,88 @@ def test_injected_agent_draft_runs_through_validator_gate(tmp_path):
             store, run_id, build_flow(empty_agent), settings) is RunState.COMPLETE
         assert store.latest(run_id, "agent_fallback")[
             "kind"] == "incomplete_proposal"
+
+
+def test_validator_requests_fragmentation_before_deadline():
+    user_profile = profile(window(11, 21))
+    urgent = task(
+        duration=240,
+        deadline=DAY.replace(hour=14),
+        deadline_type="hard",
+    )
+    result = validate_schedule(
+        baseline_schedule([urgent], user_profile),
+        [urgent],
+        user_profile,
+        [],
+    )
+
+    assert result.status == "BLOCK"
+    conflict = result.conflicts[0]
+    assert conflict.conflict_type == "fragmentation"
+    assert "split" in conflict.explanation.lower()
+
+
+def test_fragmented_task_can_pass_before_deadline():
+    user_profile = profile(window(11, 21))
+    urgent = task(
+        duration=180,
+        deadline=DAY.replace(hour=14),
+        deadline_type="hard",
+        fragmentable=True,
+        min_fragment_duration=60,
+        preferred_fragment_duration=60,
+    )
+    schedule = fragment_task(urgent, user_profile)
+    result = validate_schedule(schedule, [urgent], user_profile, [])
+
+    assert len(schedule.blocks) == 3
+    assert result.status == "PASS"
+
+
+def test_agent_loop_asks_and_resolves_fragmentation(tmp_path):
+    store = Store(tmp_path / "fragment-loop.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(11, 14))
+    user_profile.protected_blocks = [window(12, 13)]
+    urgent = task(
+        duration=120,
+        deadline=DAY.replace(hour=14),
+        deadline_type="hard",
+        fragmentable=True,
+        min_fragment_duration=60,
+        preferred_fragment_duration=60,
+    )
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [urgent.model_dump(mode="json")],
+            "existing_blocks": [],
+        },
+        produced_by="test",
+    )
+    settings = Settings(
+        api_key="test",
+        model="model",
+        fallback_model="fallback",
+        escalation_model="escalation",
+        max_tokens=100,
+        max_tokens_per_run=1000,
+        max_attempts_per_step=2,
+        expert_timeout_minutes=45,
+        langfuse_public="",
+        langfuse_secret="",
+        langfuse_host="",
+    )
+
+    assert runner.advance(store, run_id, build_flow(),
+                          settings) is RunState.AWAITING_EXPERT
+    question = callback.pending(store, run_id)[0]
+    assert "fragment" in question.question.lower()
+    callback.answer(store, question.id, "fragment the task", who="user")
+
+    assert runner.advance(store, run_id, build_flow(),
+                          settings) is RunState.COMPLETE
+    assert len(store.latest(run_id, "decision")["schedule"]["blocks"]) == 2

@@ -7,6 +7,7 @@ Without a model call, the deterministic planner remains available offline.
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 from slice import callback
@@ -21,7 +22,7 @@ from .schema import (
     Task,
     UserScheduleProfile,
 )
-from .planner import baseline_schedule, reschedule_task
+from .planner import baseline_schedule, fragment_task, reschedule_task
 from .validator import validate_schedule
 
 
@@ -103,7 +104,15 @@ def build_flow(call=None):
         return len(ctx.history("reschedule_attempt")) >= MAX_REVISIONS
 
     def _ask_user(ctx, validation: ScheduleValidationResult) -> RunState:
+        has_fragmentation = any(
+            conflict.conflict_type == "fragmentation"
+            for conflict in validation.conflicts
+        )
         question = (
+            "A task cannot fit as one session before its deadline. Should I "
+            "fragment it into smaller sessions? Reply 'fragment the task', "
+            "or choose another task for tomorrow."
+            if has_fragmentation else
             "No safe slot was found today. Choose one: (1) shorten the missed "
             "task, (2) move the blocking task to tomorrow, or (3) move the "
             "missed task to tomorrow."
@@ -166,6 +175,56 @@ def build_flow(call=None):
                 produced_by="user_decision",
             )
             return RunState.COMPLETE
+
+        if answer_text and "shorten" in answer_text:
+            duration_match = re.search(
+                r"\b(?:to|for)\s+(\d+)\s*(?:minutes?|mins?)?", answer_text)
+            if duration_match:
+                tasks, _, _ = _models(ctx)
+                conflict = next(
+                    (
+                        item for item in (ctx.latest("validation") or {}).get("conflicts", [])
+                        if item.get("task_id")
+                    ),
+                    None,
+                )
+                task_id = conflict.get("task_id") if conflict else None
+                shortened_duration = int(duration_match.group(1))
+                if task_id and shortened_duration > 0:
+                    payload = dict(payload)
+                    payload["tasks"] = [
+                        {
+                            **task.model_dump(mode="json"),
+                            "estimated_duration": (
+                                shortened_duration
+                                if task.id == task_id
+                                else task.estimated_duration
+                            ),
+                        }
+                        for task in tasks
+                    ]
+                    ctx.append("input", payload, produced_by="user_decision")
+
+        if answer_text and any(
+            phrase in answer_text
+            for phrase in ("fragment", "split the task", "split it")
+        ):
+            tasks, profile, existing = _models(ctx)
+            conflict_ids = {
+                conflict.get("task_id")
+                for conflict in (ctx.latest("validation") or {}).get("conflicts", [])
+                if conflict.get("conflict_type") == "fragmentation"
+            }
+            task_to_fragment = next(
+                (task for task in tasks if task.id in conflict_ids), None)
+            if task_to_fragment is not None:
+                schedule = fragment_task(task_to_fragment, profile, existing)
+                ctx.append(
+                    "proposed_schedule",
+                    schedule.model_dump(mode="json"),
+                    produced_by="agent:fragmentation",
+                )
+                return RunState.GATING
 
         tasks, profile, existing = _models(ctx)
         missed_task_id = payload.get(

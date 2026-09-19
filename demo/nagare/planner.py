@@ -163,6 +163,35 @@ def baseline_schedule(tasks, profile):
     )
 
 
+def fragment_task(task, profile, existing=None):
+    """Place a task across multiple feasible sessions before its deadline."""
+    blocks = list(existing or [])
+    remaining = task.estimated_duration
+    fragment_length = task.preferred_fragment_duration or task.min_fragment_duration or 30
+    fragment_length = max(fragment_length, task.min_fragment_duration or 1)
+    fragment_number = 1
+
+    while remaining > 0:
+        duration = min(fragment_length, remaining)
+        slots = candidate_slots(task, duration, profile, blocks)
+        if not slots:
+            break
+        start, end = slots[0]
+        blocks.append(ScheduleBlock(
+            id=f"block_{task.id}_{fragment_number}",
+            task_id=task.id,
+            start=start,
+            end=end,
+            block_type="task",
+            locked=task.fixed or not task.movable,
+        ))
+        remaining -= duration
+        fragment_number += 1
+
+    blocks.sort(key=lambda block: block.start)
+    return ProposedSchedule(blocks=blocks, conflicts=[], reschedule_attempts=[])
+
+
 def reschedule_task(
     task,
     remaining_minutes,

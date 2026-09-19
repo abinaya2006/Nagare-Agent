@@ -158,6 +158,7 @@ def _schedule_html(run_id: str) -> str:
     return (
         f"<h1>Your schedule</h1><p class='sub'>Run {html.escape(run_id)} · "
         f"Status: <span class='status'>{html.escape(state.value)}</span></p>"
+        "<p class='sub'><strong>Got it.</strong> Here is the latest schedule after your decision.</p>"
         f"{failure_notice}"
         f"{decision}"
         "<div class='card'><table><thead><tr><th>Time</th><th>Task</th><th>Status</th></tr></thead>"
@@ -301,6 +302,15 @@ def reschedule(run_id: str, task_id: str = Form(...), reason: str = Form("")):
         )
 
 
+@app.get("/runs/{run_id}", response_class=HTMLResponse)
+def show_run(run_id: str):
+    try:
+        _store().get_state(run_id)
+    except KeyError:
+        return _page("Not found", "<h1>Not found</h1><p class='sub'>No such schedule run.</p>")
+    return _page("Schedule updated", _schedule_html(run_id))
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     s = _store()
@@ -371,6 +381,7 @@ def submit(qid: str, answer: str = Form(...), who: str = Form("user")):
             from slice.llm import complete
             call = complete
         runner.advance(store, run_id, build_flow(call), current_settings)
+        return RedirectResponse(f"/runs/{run_id}", status_code=303)
     return RedirectResponse("/thanks", status_code=303)
 
 

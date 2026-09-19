@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from .planner import _overlaps, _protected
+from .planner import _overlaps, _protected, candidate_slots
 from .schema import (
     Conflict,
     ScheduleValidationResult,
@@ -45,8 +45,29 @@ def validate_schedule(
         if block.block_type == "task" and block.task_id is not None
     }
 
+    scheduled_minutes = {}
+    for block in schedule.blocks:
+        if block.block_type == "task" and block.task_id is not None:
+            scheduled_minutes[block.task_id] = scheduled_minutes.get(block.task_id, 0) + int(
+                (block.end - block.start).total_seconds() // 60
+            )
+
     for task in tasks:
         if task.id in scheduled_task_ids:
+            if scheduled_minutes.get(task.id, 0) < task.estimated_duration:
+                conflicts.append(
+                    Conflict(
+                        task_id=task.id,
+                        conflict_type="duration",
+                        severity=task.consequence_of_delay,
+                        resolvable=True,
+                        explanation=(
+                            f"Task '{task.title}' has only "
+                            f"{scheduled_minutes[task.id]} of {task.estimated_duration} "
+                            "minutes scheduled."
+                        ),
+                    )
+                )
             continue
 
         conflict_type = "unresolved_constraint"
@@ -55,6 +76,12 @@ def validate_schedule(
             "available time without violating a constraint."
         )
         available_minutes = available_minutes_before_deadline(task)
+        no_single_slot = bool(task.deadline) and not candidate_slots(
+            task,
+            task.estimated_duration,
+            profile,
+            locked_blocks,
+        )
         if task.deadline and 0 < available_minutes < task.estimated_duration:
             conflict_type = "fragmentation"
             explanation = (
@@ -62,6 +89,14 @@ def validate_schedule(
                 f"before its {task.deadline.strftime('%H:%M')} deadline, but "
                 f"needs {task.estimated_duration} minutes. Ask whether to "
                 "split it into smaller sessions."
+            )
+        elif task.deadline and no_single_slot and available_minutes >= task.estimated_duration:
+            conflict_type = "fragmentation"
+            explanation = (
+                f"Task '{task.title}' has enough total time before its "
+                f"{task.deadline.strftime('%H:%M')} deadline, but no single "
+                "uninterrupted slot. Ask whether to split it around the "
+                "protected time."
             )
 
         conflicts.append(
