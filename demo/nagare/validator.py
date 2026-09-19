@@ -171,17 +171,24 @@ def validate_schedule(
         matching_block = None
 
         for block in schedule.blocks:
-            if block.task_id == locked.task_id:
+            if block.id == locked.id:
                 matching_block = block
                 break
+
+            if (
+                matching_block is None
+                and block.task_id == locked.task_id
+                and block.task_id is not None
+            ):
+                matching_block = block
 
         # Locked block disappeared
         if matching_block is None:
             conflicts.append(
                 Conflict(
                     task_id=locked.task_id,
-                    conflicting_block_id=locked.task_id,
-                    conflict_type="protected_block",
+                    conflicting_block_id=locked.id,
+                    conflict_type="locked_block",
                     severity=5,
                     resolvable=False,
                     explanation=(
@@ -201,12 +208,12 @@ def validate_schedule(
             conflicts.append(
                 Conflict(
                     task_id=locked.task_id,
-                    conflicting_block_id=locked.task_id,
-                    conflict_type="protected_block",
+                    conflicting_block_id=locked.id,
+                    conflict_type="locked_block",
                     severity=5,
                     resolvable=False,
                     explanation=(
-                        "A locked block was moved."
+                        "A locked block was changed or moved."
                     ),
                 )
             )
