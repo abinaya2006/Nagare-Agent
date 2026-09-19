@@ -227,10 +227,11 @@ call doesn't quietly eat a revision.
 class ScheduleBlock(BaseModel):
     id: str
     title: str
-    slot: str          # "HH:MM-HH:MM"
+    slot: str  # "HH:MM-HH:MM"
     movable: bool
     protected: bool
     deadline: str | None = None
+
 
 class RescheduleAttempt(BaseModel):
     attempt: int
@@ -239,9 +240,11 @@ class RescheduleAttempt(BaseModel):
     bumped: list[str] = Field(max_length=3)
     reasoning: str
 
+
 class Conflict(BaseModel):
     with_block: str
     why: str
+
 
 class ConflictCheck(BaseModel):
     attempt: int
