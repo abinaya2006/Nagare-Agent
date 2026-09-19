@@ -1,39 +1,226 @@
-"""Independent schedule validation (the planner never certifies itself)."""
-from __future__ import annotations
-
 from .planner import _overlaps, _protected
-from .schema import (Conflict, ProposedSchedule, ScheduleValidationResult, Task,
-                     UserScheduleProfile)
+from .schema import (
+    Conflict,
+    ScheduleValidationResult,
+)
 
 
-def validate_schedule(schedule: ProposedSchedule, tasks: list[Task],
-                      profile: UserScheduleProfile, locked_blocks: list) -> ScheduleValidationResult:
-    conflicts: list[Conflict] = []
-    by_id = {task.id: task for task in tasks}
+def validate_schedule(
+    schedule,
+    tasks,
+    profile,
+    locked_blocks,
+):
+    conflicts = []
+
+    by_id = {
+        task.id: task
+        for task in tasks
+    }
+
+    # --------------------------------------------------
+    # 1. Validate every scheduled task
+    # --------------------------------------------------
+
     for index, block in enumerate(schedule.blocks):
-        task = by_id.get(block.task_id or "")
-        if task is None or block.block_type != "task":
+
+        if block.block_type != "task":
             continue
-        if _protected(block.start, block.end, profile):
-            conflicts.append(Conflict(task_id=task.id, conflict_type="protected_block", severity=5,
-                                      resolvable=False, explanation="Task overlaps protected time."))
+
+        task = by_id.get(block.task_id)
+
+        if task is None:
+            continue
+
+        # Protected time
+        if _protected(
+            block.start,
+            block.end,
+            profile,
+        ):
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.task_id,
+                    conflict_type="protected_block",
+                    severity=5,
+                    resolvable=False,
+                    explanation=(
+                        f"Task '{task.title}' overlaps "
+                        "a protected or sleep period."
+                    ),
+                )
+            )
+
+        # Deadline
         if task.deadline and block.end > task.deadline:
-            conflicts.append(Conflict(task_id=task.id, conflict_type="deadline", severity=5,
-                                      resolvable=False, explanation="Task ends after its deadline."))
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.task_id,
+                    conflict_type="deadline",
+                    severity=5,
+                    resolvable=False,
+                    explanation=(
+                        f"Task '{task.title}' finishes "
+                        "after its deadline."
+                    ),
+                )
+            )
+
+        # Earliest start
+        if (
+            task.earliest_start
+            and block.start < task.earliest_start
+        ):
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.task_id,
+                    conflict_type="availability",
+                    severity=4,
+                    resolvable=True,
+                    explanation=(
+                        f"Task '{task.title}' starts "
+                        "before its allowed start time."
+                    ),
+                )
+            )
+
+        # Latest finish
+        if (
+            task.latest_finish
+            and block.end > task.latest_finish
+        ):
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.task_id,
+                    conflict_type="availability",
+                    severity=4,
+                    resolvable=True,
+                    explanation=(
+                        f"Task '{task.title}' finishes "
+                        "after its allowed finish time."
+                    ),
+                )
+            )
+
+        # Available windows
+        inside_available_window = False
+
+        for window in profile.available_windows:
+            if (
+                block.start >= window.start
+                and block.end <= window.end
+            ):
+                inside_available_window = True
+                break
+
+        if not inside_available_window:
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.task_id,
+                    conflict_type="availability",
+                    severity=4,
+                    resolvable=True,
+                    explanation=(
+                        f"Task '{task.title}' is outside "
+                        "the user's available windows."
+                    ),
+                )
+            )
+
+        # --------------------------------------------------
+        # 2. Check overlap with other blocks
+        # --------------------------------------------------
+
         for other in schedule.blocks[index + 1:]:
-            if _overlaps(block.start, block.end, other):
-                conflicts.append(Conflict(task_id=task.id, conflicting_block_id=other.id,
-                                          conflict_type="time_overlap", severity=5,
-                                          explanation="Task blocks overlap."))
-        if not any(block.start >= window.start and block.end <= window.end
-                   for window in profile.available_windows):
-            conflicts.append(Conflict(task_id=task.id, conflict_type="availability", severity=4,
-                                      explanation="Task is outside the user's availability."))
-    current = {block.id: block for block in schedule.blocks}
+
+            if not _overlaps(
+                block.start,
+                block.end,
+                other,
+            ):
+                continue
+
+            if block.task_id == other.task_id:
+                continue
+
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=other.task_id,
+                    conflict_type="time_overlap",
+                    severity=5,
+                    resolvable=True,
+                    explanation=(
+                        f"Task '{task.title}' overlaps "
+                        f"another scheduled block."
+                    ),
+                )
+            )
+
+    # --------------------------------------------------
+    # 3. Check locked blocks
+    # --------------------------------------------------
+
     for locked in locked_blocks:
-        candidate = current.get(locked.id)
-        if candidate is None or candidate.start != locked.start or candidate.end != locked.end:
-            conflicts.append(Conflict(conflicting_block_id=locked.id, conflict_type="locked_block",
-                                      severity=5, resolvable=False,
-                                      explanation="A locked block was changed or removed."))
-    return ScheduleValidationResult(status="BLOCK" if conflicts else "PASS", conflicts=conflicts)
+
+        matching_block = None
+
+        for block in schedule.blocks:
+            if block.task_id == locked.task_id:
+                matching_block = block
+                break
+
+        # Locked block disappeared
+        if matching_block is None:
+            conflicts.append(
+                Conflict(
+                    task_id=locked.task_id,
+                    conflicting_block_id=locked.task_id,
+                    conflict_type="protected_block",
+                    severity=5,
+                    resolvable=False,
+                    explanation=(
+                        "A locked block was removed "
+                        "from the schedule."
+                    ),
+                )
+            )
+
+            continue
+
+        # Locked block moved
+        if (
+            matching_block.start != locked.start
+            or matching_block.end != locked.end
+        ):
+            conflicts.append(
+                Conflict(
+                    task_id=locked.task_id,
+                    conflicting_block_id=locked.task_id,
+                    conflict_type="protected_block",
+                    severity=5,
+                    resolvable=False,
+                    explanation=(
+                        "A locked block was moved."
+                    ),
+                )
+            )
+
+    # --------------------------------------------------
+    # 4. Return validation result
+    # --------------------------------------------------
+
+    if conflicts:
+        status = "BLOCK"
+    else:
+        status = "PASS"
+
+    return ScheduleValidationResult(
+        status=status,
+        conflicts=conflicts,
+    )

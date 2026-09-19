@@ -1,134 +1,222 @@
-"""The two handlers, the domain rules, and the Flow object.
+"""Nagare's rule-based scheduling and rescheduling flow.
 
-All the business rules in this slice live here, in code, not in the prompts. The
-model returns a judgement; this file decides what that judgement means.
-
-Nothing in slice/ changes for this to run.
+The planner proposes a schedule and the validator checks it. The runner's
+state machine supplies the agentic back-edge when validation finds a conflict.
 """
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
-from slice.llm import complete
+from slice import callback
 from slice.records import RunState
 
-from .schema import OpportunityRecord, Verdict
-
-# --------------------------------------------------------------- domain rules
-
-MAX_REVISIONS = 3
-"""How many rewrites a founder gets before the run stops.
-
-This is a teaching decision, not a cost control. It is counted from the record
-history below - deliberately NOT from budget.attempt(), which is a spend fence
-and is also ticking for retries after a malformed response. Share one counter
-between them and two bad replies silently buy a founder one revision instead of
-three, which you find out on stage.
-"""
-
-_PROMPTS = Path(__file__).parent / "prompts"
+from .schema import (
+    ProposedSchedule,
+    RescheduleAttempt,
+    ScheduleValidationResult,
+    ScheduleBlock,
+    Task,
+    UserScheduleProfile,
+)
+from .planner import baseline_schedule, reschedule_task
+from .validator import validate_schedule
 
 
-def _prompt(name: str) -> str:
-    return (_PROMPTS / f"{name}.md").read_text(encoding="utf-8")
+MAX_REVISIONS = 2
 
 
-# ------------------------------------------------------------------ messages
-# Templates, not model calls. There are exactly two model calls in this build
-# and no ambiguity about which they are.
+def build_draft_messages(context: dict, prior: dict | None,
+                         validation: dict | None, answer: dict | None) -> list[dict]:
+    """Build an inspectable planner request for future model integration."""
+    return [
+        {"role": "system", "content": "Build a schedule from the supplied constraints."},
+        {"role": "user", "content": json.dumps(
+            {"context": context, "previous_schedule": prior,
+             "validation": validation, "answer": answer},
+            indent=2,
+            default=str,
+        )},
+    ]
 
-def build_spot_messages(idea: str, prior: dict | None, verdict: dict | None) -> list[dict]:
-    user = [f"The founder's paragraph:\n\n{idea}"]
-    if prior and verdict and verdict.get("status") == "BLOCK":
-        user.append("Your previous record:\n\n" + json.dumps(prior, indent=2))
-        user.append(
-            "It was blocked. Address each of these, in the field it names:\n\n"
-            + "\n".join(f"- {o['field']}: {o['problem']}" for o in verdict["objections"])
+
+def build_check_messages(context: dict, schedule: dict) -> list[dict]:
+    return [
+        {"role": "system", "content": "Check the proposed schedule against all constraints."},
+        {"role": "user", "content": json.dumps(
+            {"context": context, "schedule": schedule},
+            indent=2,
+            default=str,
+        )},
+    ]
+
+
+def build_flow(call=None):
+    """Return a deterministic Nagare Flow.
+
+    ``call`` remains accepted for compatibility with the smoke-flow shape, but
+    rule-based planning and validation do not make model calls.
+    """
+
+    def _input(ctx) -> dict:
+        return ctx.latest("input") or {}
+
+    def _models(ctx) -> tuple[list[Task], UserScheduleProfile, list[ScheduleBlock]]:
+        payload = _input(ctx)
+        tasks = [Task.model_validate(item)
+                 for item in payload.get("tasks", [])]
+        profile = UserScheduleProfile.model_validate(payload["profile"])
+        existing = [
+            ScheduleBlock.model_validate(item)
+            for item in payload.get("existing_blocks", [])
+        ]
+        return tasks, profile, existing
+
+    def _conflict_signature(conflict: dict) -> tuple:
+        return (
+            conflict.get("task_id"),
+            conflict.get("conflicting_block_id"),
+            conflict.get("conflict_type"),
         )
-    return [
-        {"role": "system", "content": _prompt("spot")},
-        {"role": "user", "content": "\n\n---\n\n".join(user)},
-    ]
 
+    def _should_ask(ctx, validation: ScheduleValidationResult) -> bool:
+        history = ctx.history("validation")
+        if len(history) >= 2:
+            previous = {
+                _conflict_signature(item)
+                for item in history[-2].payload.get("conflicts", [])
+            }
+            current = {
+                _conflict_signature(item)
+                for item in validation.conflicts
+            }
+            if previous.intersection(current):
+                return True
+        return len(ctx.history("reschedule_attempt")) >= MAX_REVISIONS
 
-def build_gate_messages(record: dict) -> list[dict]:
-    return [
-        {"role": "system", "content": _prompt("gate")},
-        {"role": "user", "content": "Judge this record:\n\n" + json.dumps(record, indent=2)},
-    ]
-
-
-# ------------------------------------------------------------------ handlers
-
-def build_flow(call=complete):
-    """Return the Flow. `call` is injected so the whole state machine can be
-    exercised with canned responses - no key, no network, no tokens. See
-    demo/smoke/stub.py."""
+    def _ask_user(ctx, validation: ScheduleValidationResult) -> RunState:
+        question = (
+            "No safe slot was found today. Choose one: (1) shorten the missed "
+            "task, (2) move the blocking task to tomorrow, or (3) move the "
+            "missed task to tomorrow."
+        )
+        callback.ask(
+            ctx.store,
+            ctx.run_id,
+            question,
+            {
+                "conflicts": [
+                    conflict.model_dump(mode="json")
+                    for conflict in validation.conflicts
+                ],
+                "resume_state": RunState.DRAFTING.value,
+            },
+            ctx.settings,
+        )
+        return RunState.AWAITING_EXPERT
 
     def handle_drafting(ctx) -> RunState:
-        idea    = ctx.latest("input")["text"]
-        prior   = ctx.latest("opportunity")     # None on the first pass
-        verdict = ctx.latest("verdict")         # objections to address, if any
+        payload = _input(ctx)
+        answer = ctx.latest("expert_answer")
+        answer_text = answer.get(
+            "answer", "").strip().lower() if answer else ""
+        if answer and not answer_text:
+            ctx.append(
+                "failure",
+                {"kind": "no_user_decision",
+                    "detail": "The scheduling question was not answered."},
+                produced_by="system",
+            )
+            return RunState.FAILED
+        if answer_text and any(
+            phrase in answer_text
+            for phrase in ("leave it missed", "leave missed", "do not move", "don't move")
+        ):
+            ctx.append(
+                "failure",
+                {"kind": "user_declined",
+                    "detail": "The user chose to leave the task unresolved."},
+                produced_by="system",
+            )
+            return RunState.FAILED
 
-        record = call(
-            settings=ctx.settings, budget=ctx.budget,
-            messages=build_spot_messages(idea, prior, verdict),
-            schema=OpportunityRecord, step="spot",
+        tasks, profile, existing = _models(ctx)
+        missed_task_id = payload.get(
+            "missed_task_id") or payload.get("block_id")
+        missed_task = next(
+            (task for task in tasks if task.id == missed_task_id), None)
+        if missed_task is not None:
+            schedule = reschedule_task(
+                missed_task,
+                missed_task.estimated_duration,
+                existing,
+                tasks,
+                profile,
+            )
+        else:
+            schedule = baseline_schedule(tasks, profile)
+
+        ctx.append(
+            "proposed_schedule",
+            schedule.model_dump(mode="json"),
+            produced_by="planner:rule_based",
         )
-        ctx.append("opportunity", record.model_dump(), produced_by="agent:spot")
+        ctx.append(
+            "reschedule_attempt",
+            RescheduleAttempt(
+                attempt_number=len(ctx.history("reschedule_attempt")) + 1,
+                reason="Place tasks by deadline, priority, and available windows.",
+                changes=[
+                    "Generated a deterministic schedule from current constraints."],
+                conflicts_found=[],
+                outcome="unresolved",
+            ).model_dump(mode="json"),
+            produced_by="planner:rule_based",
+        )
         return RunState.GATING
 
     def handle_gating(ctx) -> RunState:
-        verdict = call(
-            settings=ctx.settings, budget=ctx.budget,
-            messages=build_gate_messages(ctx.latest("opportunity")),
-            schema=Verdict, step="gate",
-        )
-        ctx.append("verdict", verdict.model_dump(), produced_by="agent:gate")
+        proposed = ctx.latest("proposed_schedule")
+        if proposed is None:
+            ctx.append(
+                "failure",
+                {"kind": "missing_schedule",
+                    "detail": "Validation started without a proposed schedule."},
+                produced_by="system",
+            )
+            return RunState.FAILED
 
-        if verdict.status == "PASS":
+        tasks, profile, existing = _models(ctx)
+        schedule = ProposedSchedule.model_validate(proposed)
+        locked_blocks = [block for block in existing if block.locked]
+        validation = validate_schedule(schedule, tasks, profile, locked_blocks)
+        ctx.append(
+            "validation",
+            validation.model_dump(mode="json"),
+            produced_by="validator:rule_based",
+        )
+
+        if validation.status == "PASS":
+            ctx.append(
+                "decision",
+                {
+                    "status": "scheduled",
+                    "schedule": schedule.model_dump(mode="json"),
+                    "validation": validation.model_dump(mode="json"),
+                    "explanation": "Schedule passed all rule-based checks.",
+                },
+                produced_by="system",
+            )
             return RunState.COMPLETE
 
-        # A revision that changed nothing will not change anything next time
-        # either. Observed live: SPOT correctly reported "the founder did not
-        # specify X", the gate objected "the founder did not specify X", and the
-        # two of them repeated that exchange until the bound stopped the run -
-        # eleven thousand tokens to learn nothing after the first round.
-        #
-        # This is the unresolved-versus-contradicted distinction from SPEC.md
-        # 8.5, in miniature. A record that admits an absence is not wrong, it is
-        # incomplete, and the remedy is not another revision - it is a question
-        # for the founder. Stopping here says something useful; turning the loop
-        # again says the same thing more expensively.
-        drafts = ctx.history("opportunity")
-        if len(drafts) >= 2 and drafts[-1].payload == drafts[-2].payload:
-            missing = sorted({o["field"] for o in verdict.model_dump()["objections"]})
-            ctx.append("failure",
-                       {"kind": "needs_the_founder",
-                        "detail": "The revision was identical to the draft before it. "
-                                  "What the gate is asking for is not in the paragraph: "
-                                  + ", ".join(missing) + ". Go back to the founder.",
-                        "missing": missing},
-                       produced_by="system")
-            return RunState.FAILED
-
-        # Counted from the record, not from the budget. See MAX_REVISIONS.
-        blocks = sum(1 for v in ctx.history("verdict")
-                     if v.payload["status"] == "BLOCK")
-        if blocks >= MAX_REVISIONS:
-            ctx.append("failure",
-                       {"kind": "gate_exhausted",
-                        "detail": f"Blocked {blocks} times; no revision passed."},
-                       produced_by="system")
-            return RunState.FAILED
+        if _should_ask(ctx, validation):
+            return _ask_user(ctx, validation)
         return RunState.DRAFTING
 
     return SimpleNamespace(
-        name="smoke",
+        name="nagare",
         handlers={
             RunState.DRAFTING: handle_drafting,
-            RunState.GATING:   handle_gating,
+            RunState.GATING: handle_gating,
         },
     )
