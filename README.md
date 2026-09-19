@@ -70,6 +70,7 @@ demo/
     flow.py           Nagare state machine and escalation behavior
     demo_data.py      sample schedule data
     NAGARE-SPEC.md    product spec for the scheduling agent
+  terminal.py         interactive terminal CLI for running Nagare and handling user decisions
   smoke/              reference demo used to understand the engine pattern
 
 tests/
@@ -118,6 +119,102 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
+### Terminal implementation flow
+
+The terminal-based implementation is the simplest way to exercise the project in practice. The real CLI entry point lives in [demo/terminal.py](demo/terminal.py).
+
+To launch the interactive version directly:
+
+```bash
+python demo/terminal.py
+```
+
+Useful one-off runs are also available:
+
+```bash
+python demo/terminal.py --run
+python demo/terminal.py --miss task-001
+python demo/terminal.py --pending
+python demo/terminal.py --replay <RUN_ID>
+```
+
+1. Start the human-answer app:
+
+```bash
+uvicorn web.expert:app --host 0.0.0.0 --port 8000
+```
+
+2. In another terminal, run the scheduler or trigger a run from the repo logic:
+
+```bash
+python - <<'PY'
+from slice.store import Store
+from slice.config import settings
+from slice import runner
+from demo.nagare.flow import build_flow
+
+store = Store('run.db')
+run_id = store.create_run('nagare')
+store.append(run_id, 'input', {
+    'tasks': [
+        {
+            'id': 'ml',
+            'title': 'ML assignment',
+            'estimated_duration': 120,
+            'priority': 5,
+            'consequence_of_delay': 5,
+            'deadline_type': 'hard',
+            'movable': True,
+            'fixed': False,
+            'earliest_start': '2026-09-19T09:00:00',
+            'latest_finish': '2026-09-19T18:00:00',
+            'deadline': '2026-09-19T18:00:00',
+        }
+    ],
+    'profile': {
+        'available_windows': [
+            {'start': '2026-09-19T09:00:00', 'end': '2026-09-19T17:00:00'}
+        ],
+        'circadian_profile': {
+            'morning_energy': 5,
+            'afternoon_energy': 3,
+            'evening_energy': 2,
+            'peak_periods': [{'start': '2026-09-19T09:00:00', 'end': '2026-09-19T12:00:00'}]
+        },
+        'preferred_work_periods': [
+            {'start': '2026-09-19T09:00:00', 'end': '2026-09-19T12:00:00'}
+        ],
+        'protected_blocks': [],
+        'preferred_session_length': 60,
+        'preferred_break_length': 30,
+        'sleep_window': {'start': '2026-09-19T23:00:00', 'end': '2026-09-20T07:00:00'},
+        'commute_windows': []
+    },
+    'existing_blocks': []
+}, produced_by='system')
+
+final_state = runner.advance(store, run_id, build_flow(), settings)
+print(final_state)
+print(store.replay(run_id)[:5])
+PY
+```
+
+3. Open the question page in a browser:
+
+```text
+http://localhost:8000/
+```
+
+4. Submit the user answer to resume the run:
+
+```text
+http://localhost:8000/q/<QUESTION_ID>
+```
+
+5. The run will resume after the answer is posted and persisted.
+
+### Test commands
+
 Run the focused Nagare tests:
 
 ```bash
@@ -140,12 +237,6 @@ Run the repo health checker:
 
 ```bash
 python scripts/doctor.py
-```
-
-Start the human question page:
-
-```bash
-uvicorn web.expert:app --host 0.0.0.0 --port 8000
 ```
 
 ---
