@@ -21,6 +21,22 @@ Usage:
     python demo/terminal.py --replay <id>    # Replay all steps of a run
 """
 from __future__ import annotations
+from demo.nagare.validator import validate_schedule
+from demo.nagare.schema import (
+    CircadianProfile,
+    ProposedSchedule,
+    ScheduleBlock,
+    Task,
+    TimeWindow,
+    UserScheduleProfile,
+)
+from demo.nagare.planner import baseline_schedule, reschedule_task
+from demo.nagare.flow import build_flow as build_nagare_flow
+from demo.nagare.demo_data import demo_tasks, demo_user_profile
+from slice.store import Store
+from slice.records import RunState
+from slice.config import settings as load_settings, Settings
+from slice import callback, runner
 
 import argparse
 from datetime import datetime, timedelta
@@ -34,23 +50,6 @@ from typing import Any
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from slice import callback, runner
-from slice.config import settings as load_settings, Settings
-from slice.records import RunState
-from slice.store import Store
-
-from demo.nagare.demo_data import demo_tasks, demo_user_profile
-from demo.nagare.flow import build_flow as build_nagare_flow
-from demo.nagare.planner import baseline_schedule, reschedule_task
-from demo.nagare.schema import (
-    CircadianProfile,
-    ProposedSchedule,
-    ScheduleBlock,
-    Task,
-    TimeWindow,
-    UserScheduleProfile,
-)
-from demo.nagare.validator import validate_schedule
 
 # ---------------------------------------------------------------------------
 # Terminal Styling Helpers
@@ -142,13 +141,14 @@ def print_schedule_table(
         time_str = f"{b.start.strftime('%H:%M')} – {b.end.strftime('%H:%M')}"
         dur_mins = int((b.end - b.start).total_seconds() // 60)
         dur_str = f"{dur_mins}m"
-        
+
         task_info = b.task_id or b.id
         if b.task_id and b.task_id in tasks_by_id:
             t = tasks_by_id[b.task_id]
             task_info = f"{t.title} [P{t.priority}, E{t.energy_required}]"
-        
-        status_tag = _c("🔒 LOCKED", AMBER) if b.locked else _c("✓ Scheduled", GREEN)
+
+        status_tag = _c("🔒 LOCKED", AMBER) if b.locked else _c(
+            "✓ Scheduled", GREEN)
         if b.block_type == "protected":
             status_tag = _c("🛡️ PROTECTED", MAGENTA)
         elif b.block_type == "break":
@@ -204,12 +204,17 @@ def run_agent_flow(
             f"Missed task {_c(missed_task_id, BOLD)} — {input_payload.get('reason')}"
         )
 
-    flow = build_nagare_flow()
+    model_call = None
+    if st.api_key:
+        from slice.llm import complete
+        model_call = complete
+    flow = build_nagare_flow(model_call)
     state = runner.advance(store, run_id, flow, st)
 
     # If the state machine pauses for a human decision, handle it interactively
     while state is RunState.AWAITING_EXPERT:
-        print(f"\n{_c('⏸️  HUMAN DECISION REQUIRED (AWAITING_EXPERT)', BOLD + AMBER)}")
+        print(
+            f"\n{_c('⏸️  HUMAN DECISION REQUIRED (AWAITING_EXPERT)', BOLD + AMBER)}")
         print(
             _c(
                 "The agent encountered a constraint conflict that cannot be safely "
@@ -217,7 +222,7 @@ def run_agent_flow(
                 DIM,
             )
         )
-        
+
         pending_qs = callback.pending(store, run_id)
         if not pending_qs:
             print(_c("No pending question found in store. Resuming...", DIM))
@@ -228,7 +233,8 @@ def run_agent_flow(
         if q.context and "conflicts" in q.context:
             print(f"{_c('Conflict Details:', DIM)}")
             for c in q.context["conflicts"]:
-                print(f"  • {_c(c.get('conflict_type', 'conflict'), RED)}: {c.get('explanation', '')}")
+                print(
+                    f"  • {_c(c.get('conflict_type', 'conflict'), RED)}: {c.get('explanation', '')}")
 
         if not interactive_callback:
             print(_c("Non-interactive mode: Run is suspended in database.", AMBER))
@@ -241,10 +247,12 @@ def run_agent_flow(
         print("  [4] Decline / Leave task unresolved")
         print("  [5] Custom text instruction")
 
-        ans_choice = input(f"{_c('Your Decision [1-5 or custom text]> ', BOLD)}").strip()
+        ans_choice = input(
+            f"{_c('Your Decision [1-5 or custom text]> ', BOLD)}").strip()
         answer_text = ""
         if ans_choice == "1":
-            ans_dur = input("Enter new shortened duration in minutes (e.g. 45): ").strip() or "45"
+            ans_dur = input(
+                "Enter new shortened duration in minutes (e.g. 45): ").strip() or "45"
             answer_text = f"shorten the missed task to {ans_dur} minutes"
         elif ans_choice == "2":
             answer_text = "move the blocking task to tomorrow"
@@ -253,7 +261,8 @@ def run_agent_flow(
         elif ans_choice == "4":
             answer_text = "leave it missed and do not move other tasks"
         elif ans_choice == "5":
-            answer_text = input("Enter your custom scheduling instruction: ").strip()
+            answer_text = input(
+                "Enter your custom scheduling instruction: ").strip()
         else:
             answer_text = ans_choice
 
@@ -282,22 +291,28 @@ def run_agent_flow(
         by = v.produced_by
         if k == "proposed_schedule":
             num_blocks = len(v.payload.get("blocks", []))
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('DRAFT', CYAN)}: Proposed {num_blocks} blocks {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('DRAFT', CYAN)}: Proposed {
+                  num_blocks} blocks {_c(f'({by})', DIM)}")
         elif k == "validation":
             st_val = v.payload.get("status")
             confs = len(v.payload.get("conflicts", []))
             color = GREEN if st_val == "PASS" else RED
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('GATING', color)}: Validation {st_val} ({confs} conflicts) {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('GATING', color)}: Validation {
+                  st_val} ({confs} conflicts) {_c(f'({by})', DIM)}")
             for cf in v.payload.get("conflicts", []):
                 print(f"         {_c('!', RED)} {cf.get('explanation')}")
         elif k == "question":
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('CALLBACK', AMBER)}: Parked question for user {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('CALLBACK', AMBER)
+                                              }: Parked question for user {_c(f'({by})', DIM)}")
         elif k == "expert_answer":
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('USER_ANSWER', GREEN)}: \"{v.payload.get('answer')}\" {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('USER_ANSWER', GREEN)}: \"{
+                  v.payload.get('answer')}\" {_c(f'({by})', DIM)}")
         elif k == "decision":
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('DECISION', GREEN)}: {v.payload.get('explanation', 'Finished')} {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('DECISION', GREEN)}: {
+                  v.payload.get('explanation', 'Finished')} {_c(f'({by})', DIM)}")
         elif k == "failure":
-            print(f"  {_c(f'#{v.seq}', DIM)} {_c('FAILURE', RED)}: {v.payload.get('kind')} — {v.payload.get('detail')} {_c(f'({by})', DIM)}")
+            print(f"  {_c(f'#{v.seq}', DIM)} {_c('FAILURE', RED)}: {
+                  v.payload.get('kind')} — {v.payload.get('detail')} {_c(f'({by})', DIM)}")
 
     # Display final schedule if available
     latest_sched = store.latest(run_id, "proposed_schedule")
@@ -329,22 +344,29 @@ def interactive_add_task(tasks: list[Task]) -> None:
     dur = int(dur_str) if dur_str.isdigit() else 60
 
     prio_str = input("Priority (1=Lowest, 5=Highest) [default: 3]: ").strip()
-    prio = int(prio_str) if prio_str.isdigit() and 1 <= int(prio_str) <= 5 else 3
+    prio = int(prio_str) if prio_str.isdigit(
+    ) and 1 <= int(prio_str) <= 5 else 3
 
-    energy_str = input("Energy Required (1=Low, 5=Deep Focus) [default: 3]: ").strip()
-    energy = int(energy_str) if energy_str.isdigit() and 0 <= int(energy_str) <= 5 else 3
+    energy_str = input(
+        "Energy Required (1=Low, 5=Deep Focus) [default: 3]: ").strip()
+    energy = int(energy_str) if energy_str.isdigit(
+    ) and 0 <= int(energy_str) <= 5 else 3
 
-    cat = input("Category (study, project, personal, admin) [default: study]: ").strip() or "study"
+    cat = input(
+        "Category (study, project, personal, admin) [default: study]: ").strip() or "study"
 
-    dl_input = input("Deadline today (HH:MM format, e.g. 18:00, or Enter for None): ").strip()
+    dl_input = input(
+        "Deadline today (HH:MM format, e.g. 18:00, or Enter for None): ").strip()
     deadline = None
     dl_type = "none"
     if dl_input:
         try:
             now = datetime.now()
             parts = [int(p) for p in dl_input.split(":")]
-            deadline = now.replace(hour=parts[0], minute=parts[1], second=0, microsecond=0)
-            dl_type_in = input("Deadline type (hard/soft) [default: hard]: ").strip().lower()
+            deadline = now.replace(
+                hour=parts[0], minute=parts[1], second=0, microsecond=0)
+            dl_type_in = input(
+                "Deadline type (hard/soft) [default: hard]: ").strip().lower()
             dl_type = "soft" if dl_type_in == "soft" else "hard"
         except Exception:
             print(_c("Invalid time format; setting no deadline.", AMBER))
@@ -377,13 +399,15 @@ def interactive_miss_task(
     for idx, t in enumerate(tasks, 1):
         print(f"  [{idx}] {_c(t.id, CYAN)}: {t.title} ({t.estimated_duration}m)")
 
-    choice = input(f"{_c('Select task number [1-' + str(len(tasks)) + ']> ', BOLD)}").strip()
+    choice = input(
+        f"{_c('Select task number [1-' + str(len(tasks)) + ']> ', BOLD)}").strip()
     if not choice.isdigit() or not (1 <= int(choice) <= len(tasks)):
         print(_c("Invalid task selection.", RED))
         return
 
     selected_task = tasks[int(choice) - 1]
-    reason = input("What caused the interruption? (e.g. Lab ran late, urgent call): ").strip()
+    reason = input(
+        "What caused the interruption? (e.g. Lab ran late, urgent call): ").strip()
     if not reason:
         reason = f"{selected_task.title} was interrupted."
 
@@ -409,7 +433,7 @@ def interactive_chat_with_agent(
 ) -> None:
     print(f"\n{_c('💬 Chat with Nagare Agent (NANI)', BOLD + CYAN)}")
     print(_c("Ask questions about your day, circadian energy alignment, or scheduling advice. Type 'exit' to return.", DIM))
-    
+
     while True:
         try:
             query = input(f"\n{_c('You> ', BOLD + GREEN)}").strip()
@@ -443,7 +467,8 @@ def interactive_chat_with_agent(
                     },
                 ]
                 print(_c("NANI is thinking...", DIM))
-                ans = complete(settings=st, budget=budget, messages=messages, model=st.model)
+                ans = complete(settings=st, budget=budget,
+                               messages=messages, model=st.model)
                 print(f"\n{_c('NANI>', BOLD + CYAN)} {ans}")
             else:
                 # Deterministic intelligent helper
@@ -456,15 +481,20 @@ def interactive_chat_with_agent(
                         f"like '{tasks[0].title if tasks else 'your top project'}' should be tackled in this window."
                     )
                 elif "deadline" in q_low or "urgent" in q_low:
-                    hard_tasks = [t for t in tasks if t.deadline_type == "hard"]
+                    hard_tasks = [
+                        t for t in tasks if t.deadline_type == "hard"]
                     if hard_tasks:
-                        print(f"You have {len(hard_tasks)} hard deadline task(s): {', '.join(t.title for t in hard_tasks)}.")
+                        print(
+                            f"You have {len(hard_tasks)} hard deadline task(s): {', '.join(t.title for t in hard_tasks)}.")
                     else:
-                        print("You have no hard deadline tasks today. Focus on priority ranking.")
+                        print(
+                            "You have no hard deadline tasks today. Focus on priority ranking.")
                 elif "reschedule" in q_low or "miss" in q_low:
-                    print("To reschedule a missed block, use option [4] (Simulate Interruption) in the main menu.")
+                    print(
+                        "To reschedule a missed block, use option [4] (Simulate Interruption) in the main menu.")
                 elif "task" in q_low or "list" in q_low:
-                    print(f"You currently have {len(tasks)} tasks queued totaling {sum(t.estimated_duration for t in tasks)} minutes of planned work.")
+                    print(
+                        f"You currently have {len(tasks)} tasks queued totaling {sum(t.estimated_duration for t in tasks)} minutes of planned work.")
                 else:
                     print(
                         "I am monitoring your schedule. All high-energy tasks are placed before afternoon dips, "
@@ -480,13 +510,14 @@ def interactive_show_profile(profile: UserScheduleProfile) -> None:
     print(f"  • {_c('Morning Energy (09:00-12:00):', DIM)}   {format_energy_bar(cp.morning_energy)} ({cp.morning_energy}/5)")
     print(f"  • {_c('Afternoon Energy (12:00-17:00):', DIM)} {format_energy_bar(cp.afternoon_energy)} ({cp.afternoon_energy}/5)")
     print(f"  • {_c('Evening Energy (17:00-21:00):', DIM)}   {format_energy_bar(cp.evening_energy)} ({cp.evening_energy}/5)")
-    
+
     sleep_str = f"{profile.sleep_window.start.strftime('%H:%M')} – {profile.sleep_window.end.strftime('%H:%M')}"
     print(f"  • {_c('Sleep Window (Immovable):', MAGENTA)}    {sleep_str}")
-    
+
     print(f"  • {_c('Preferred Work Block:', DIM)}     {profile.preferred_session_length}m work / {profile.preferred_break_length}m break")
     if profile.available_windows:
-        w_str = ", ".join(f"{w.start.strftime('%H:%M')}–{w.end.strftime('%H:%M')}" for w in profile.available_windows)
+        w_str = ", ".join(
+            f"{w.start.strftime('%H:%M')}–{w.end.strftime('%H:%M')}" for w in profile.available_windows)
         print(f"  • {_c('Available Waking Windows:', DIM)} {w_str}")
     print()
 
@@ -500,16 +531,19 @@ def interactive_show_pending_questions(store: Store) -> None:
         return
 
     for idx, q in enumerate(open_qs, 1):
-        print(f"\n  [{idx}] {_c('Question ID:', DIM)} {q.id}  {_c('Run ID:', DIM)} {q.run_id}")
+        print(
+            f"\n  [{idx}] {_c('Question ID:', DIM)} {q.id}  {_c('Run ID:', DIM)} {q.run_id}")
         print(f"      {_c(q.question, BOLD)}")
 
-    ans_idx = input(f"\n{_c('Answer a question? Enter number [1-' + str(len(open_qs)) + ' or Enter to cancel]> ', BOLD)}").strip()
+    ans_idx = input(
+        f"\n{_c('Answer a question? Enter number [1-' + str(len(open_qs)) + ' or Enter to cancel]> ', BOLD)}").strip()
     if ans_idx.isdigit() and 1 <= int(ans_idx) <= len(open_qs):
         q = open_qs[int(ans_idx) - 1]
         ans = input(f"Your answer for {q.id}: ").strip()
         if ans:
             callback.answer(store, q.id, ans, who="terminal_user")
-            print(_c(f"✓ Recorded answer for run {q.run_id}. Run can now be resumed.", GREEN))
+            print(
+                _c(f"✓ Recorded answer for run {q.run_id}. Run can now be resumed.", GREEN))
 
 
 def run_smoke_agent(store: Store, st: Settings) -> None:
@@ -517,7 +551,8 @@ def run_smoke_agent(store: Store, st: Settings) -> None:
     from demo.smoke.flow import build_flow as build_smoke_flow
     from demo.smoke.stub import Stub
 
-    print(f"\n{_c('🔬 Running Smoke Test Agent (Founder Thesis Evaluator)...', BOLD + CYAN)}")
+    print(
+        f"\n{_c('🔬 Running Smoke Test Agent (Founder Thesis Evaluator)...', BOLD + CYAN)}")
     idea = (
         "AI can help fix campus placements - students struggle to get internships "
         "and it is a real problem. Take my batchmate Karthik: 7.2 CGPA, two Android "
@@ -526,7 +561,7 @@ def run_smoke_agent(store: Store, st: Settings) -> None:
         "human ever opening his file. He got in eventually through a senior. The "
         "portal only started filtering below 8.0 from the 2025 cycle."
     )
-    
+
     run_id = store.create_run("smoke")
     store.append(run_id, "input", {"text": idea}, produced_by="system")
 
@@ -540,12 +575,16 @@ def run_smoke_agent(store: Store, st: Settings) -> None:
 
     for v in store.replay(run_id):
         if v.kind == "opportunity":
-            print(f"  {_c('SPOT', CYAN)}: Drafted thesis opportunity {_c(f'(seq #{v.seq})', DIM)}")
+            print(
+                f"  {_c('SPOT', CYAN)}: Drafted thesis opportunity {_c(f'(seq #{v.seq})', DIM)}")
         elif v.kind == "verdict":
-            tag = _c("BLOCK", AMBER) if v.payload.get("status") == "BLOCK" else _c("PASS", GREEN)
-            print(f"  {_c('GATE', BOLD)}: {tag} ({len(v.payload.get('objections', []))} objections)")
+            tag = _c("BLOCK", AMBER) if v.payload.get(
+                "status") == "BLOCK" else _c("PASS", GREEN)
+            print(
+                f"  {_c('GATE', BOLD)}: {tag} ({len(v.payload.get('objections', []))} objections)")
             for o in v.payload.get("objections", []):
-                print(f"        {_c('-', DIM)} {o.get('field')}: {o.get('problem')[:70]}...")
+                print(
+                    f"        {_c('-', DIM)} {o.get('field')}: {o.get('problem')[:70]}...")
 
     print(f"\n  {_c('=> Outcome:', BOLD)} {_c(final.value.upper(), GREEN if final is RunState.COMPLETE else RED)}")
 
@@ -559,7 +598,8 @@ def replay_run(store: Store, run_id: str) -> None:
 
     for v in events:
         body = json.dumps(v.payload, indent=2, default=str)
-        print(f"\n{_c(f'#{v.seq}', DIM)} {_c(v.kind, BOLD)} {_c(f'by {v.produced_by}', CYAN)}")
+        print(f"\n{_c(f'#{v.seq}', DIM)} {_c(v.kind, BOLD)} {
+              _c(f'by {v.produced_by}', CYAN)}")
         for line in body.splitlines()[:15]:
             print(f"    {line}")
         if len(body.splitlines()) > 15:
@@ -582,13 +622,16 @@ def main_interactive_menu(db_path: str) -> None:
 
     while True:
         print(f"\n{_c('Main Menu:', BOLD)}")
-        print(f"  {_c('[1]', CYAN)} Plan / Run Baseline Schedule (Agent Workflow)")
+        print(
+            f"  {_c('[1]', CYAN)} Plan / Run Baseline Schedule (Agent Workflow)")
         print(f"  {_c('[2]', CYAN)} View Current Tasks ({len(tasks)} loaded)")
         print(f"  {_c('[3]', CYAN)} Add New Task")
-        print(f"  {_c('[4]', CYAN)} Simulate Interruption / Missed Task (Auto-Reschedule)")
+        print(
+            f"  {_c('[4]', CYAN)} Simulate Interruption / Missed Task (Auto-Reschedule)")
         print(f"  {_c('[5]', CYAN)} Chat with Nagare Agent (NANI)")
         print(f"  {_c('[6]', CYAN)} Check Pending Human-in-the-Loop Questions")
-        print(f"  {_c('[7]', CYAN)} View User Circadian Profile & Energy Windows")
+        print(
+            f"  {_c('[7]', CYAN)} View User Circadian Profile & Energy Windows")
         print(f"  {_c('[8]', CYAN)} Run Smoke Test Agent (Spot & Gate)")
         print(f"  {_c('[9]', CYAN)} Replay Run History")
         print(f"  {_c('[0]', RED)}  Exit")
@@ -622,7 +665,8 @@ def main_interactive_menu(db_path: str) -> None:
             interactive_miss_task(store, tasks, profile, last_schedule, st)
 
         elif choice in ("5", "chat", "ask"):
-            interactive_chat_with_agent(store, tasks, profile, last_schedule, st)
+            interactive_chat_with_agent(
+                store, tasks, profile, last_schedule, st)
 
         elif choice in ("6", "pending", "questions"):
             interactive_show_pending_questions(store)
@@ -673,12 +717,18 @@ def main() -> int:
         description="Nagare Terminal Interface — Interactive CLI for the Nagare Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--db", default="run.db", help="SQLite database path (default: run.db)")
-    parser.add_argument("--run", action="store_true", help="Run baseline schedule non-interactively")
-    parser.add_argument("--miss", metavar="TASK_ID", help="Trigger reschedule for a specific task ID")
-    parser.add_argument("--smoke", action="store_true", help="Run the smoke test evaluator agent")
-    parser.add_argument("--pending", action="store_true", help="List all open human callback questions")
-    parser.add_argument("--replay", metavar="RUN_ID", help="Replay events for a specific run ID")
+    parser.add_argument("--db", default="run.db",
+                        help="SQLite database path (default: run.db)")
+    parser.add_argument("--run", action="store_true",
+                        help="Run baseline schedule non-interactively")
+    parser.add_argument("--miss", metavar="TASK_ID",
+                        help="Trigger reschedule for a specific task ID")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Run the smoke test evaluator agent")
+    parser.add_argument("--pending", action="store_true",
+                        help="List all open human callback questions")
+    parser.add_argument("--replay", metavar="RUN_ID",
+                        help="Replay events for a specific run ID")
 
     args = parser.parse_args()
     store = Store(args.db)

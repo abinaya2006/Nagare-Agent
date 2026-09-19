@@ -114,7 +114,12 @@ def _run_schedule(payload: dict) -> tuple[str, RunState]:
     store = _store()
     run_id = store.create_run("nagare")
     store.append(run_id, "input", payload, produced_by="web_user")
-    return run_id, runner.advance(store, run_id, build_flow(), load_settings())
+    settings = load_settings()
+    call = None
+    if os.environ.get("NAGARE_AGENT_MODE", "offline").lower() == "model" and settings.api_key:
+        from slice.llm import complete
+        call = complete
+    return run_id, runner.advance(store, run_id, build_flow(call), settings)
 
 
 def _schedule_html(run_id: str) -> str:
@@ -122,6 +127,7 @@ def _schedule_html(run_id: str) -> str:
     state = store.get_state(run_id)
     input_data = store.latest(run_id, "input") or {}
     schedule = store.latest(run_id, "proposed_schedule") or {}
+    failure = store.latest(run_id, "failure")
     tasks = {task["id"]: task for task in input_data.get("tasks", [])}
     rows = "".join(
         "<tr>"
@@ -143,9 +149,16 @@ def _schedule_html(run_id: str) -> str:
             f"<p class='sub'>{html.escape(question.question)}</p>"
             f"<a class='nav-link' href='/q/{html.escape(question.id)}'>Answer this decision</a></div>"
         )
+    failure_notice = ""
+    if failure:
+        failure_notice = (
+            "<div class='error'><strong>Run stopped safely.</strong> "
+            f"{html.escape(failure.get('detail', 'The planner could not finish.'))}</div>"
+        )
     return (
         f"<h1>Your schedule</h1><p class='sub'>Run {html.escape(run_id)} · "
         f"Status: <span class='status'>{html.escape(state.value)}</span></p>"
+        f"{failure_notice}"
         f"{decision}"
         "<div class='card'><table><thead><tr><th>Time</th><th>Task</th><th>Status</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>"
@@ -348,7 +361,16 @@ def submit(qid: str, answer: str = Form(...), who: str = Form("user")):
     text = (answer or "").strip()
     if not text:
         return RedirectResponse(f"/q/{qid}", status_code=303)
-    callback.answer(_store(), qid, text, who=who)
+    store = _store()
+    run_id = callback.answer(store, qid, text, who=who)
+    if run_id:
+        current_settings = load_settings()
+        call = None
+        if (os.environ.get("NAGARE_AGENT_MODE", "offline").lower() == "model"
+                and current_settings.api_key):
+            from slice.llm import complete
+            call = complete
+        runner.advance(store, run_id, build_flow(call), current_settings)
     return RedirectResponse("/thanks", status_code=303)
 
 

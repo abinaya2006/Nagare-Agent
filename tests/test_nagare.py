@@ -4,15 +4,21 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
+from demo.nagare.flow import build_flow
 from demo.nagare.planner import baseline_schedule, candidate_slots, reschedule_task
 from demo.nagare.schema import (
     CircadianProfile,
+    ProposedSchedule,
     ScheduleBlock,
     Task,
     TimeWindow,
     UserScheduleProfile,
 )
 from demo.nagare.validator import validate_schedule
+from slice import runner
+from slice.config import Settings
+from slice.records import RunState
+from slice.store import Store
 
 
 DAY = datetime(2026, 9, 19)
@@ -191,3 +197,87 @@ def test_validator_detects_changed_locked_block():
 def test_task_rejects_inconsistent_deadline_fields():
     with pytest.raises(ValidationError):
         task(deadline=DAY, deadline_type="none")
+
+
+def test_injected_agent_draft_runs_through_validator_gate(tmp_path):
+    store = Store(tmp_path / "agent.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(9, 12))
+    user_task = task(duration=60)
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [user_task.model_dump(mode="json")],
+            "existing_blocks": [],
+        },
+        produced_by="test",
+    )
+
+    calls = []
+
+    def fake_agent(**kwargs):
+        calls.append(kwargs)
+        return baseline_schedule([user_task], user_profile)
+
+    settings = Settings(
+        api_key="test",
+        model="model",
+        fallback_model="fallback",
+        escalation_model="escalation",
+        max_tokens=100,
+        max_tokens_per_run=1000,
+        max_attempts_per_step=2,
+        expert_timeout_minutes=45,
+        langfuse_public="",
+        langfuse_secret="",
+        langfuse_host="",
+    )
+
+    final_state = runner.advance(
+        store, run_id, build_flow(fake_agent), settings)
+
+    assert final_state is RunState.COMPLETE
+    assert calls[0]["schema"] is ProposedSchedule
+    assert store.latest(run_id, "decision")["status"] == "scheduled"
+    assert store.history(run_id, "proposed_schedule")[
+        0].produced_by == "agent:nagare_draft"
+
+    def test_empty_agent_proposal_uses_feasible_fallback(tmp_path):
+        store = Store(tmp_path / "agent-fallback.db")
+        run_id = store.create_run("nagare")
+        user_profile = profile(window(9, 21))
+        user_task = task(duration=90, deadline=DAY.replace(hour=18))
+        store.append(
+            run_id,
+            "input",
+            {
+                "profile": user_profile.model_dump(mode="json"),
+                "tasks": [user_task.model_dump(mode="json")],
+                "existing_blocks": [],
+            },
+            produced_by="test",
+        )
+
+        def empty_agent(**kwargs):
+            return ProposedSchedule()
+
+        settings = Settings(
+            api_key="test",
+            model="model",
+            fallback_model="fallback",
+            escalation_model="escalation",
+            max_tokens=100,
+            max_tokens_per_run=1000,
+            max_attempts_per_step=2,
+            expert_timeout_minutes=45,
+            langfuse_public="",
+            langfuse_secret="",
+            langfuse_host="",
+        )
+
+        assert runner.advance(
+            store, run_id, build_flow(empty_agent), settings) is RunState.COMPLETE
+        assert store.latest(run_id, "agent_fallback")[
+            "kind"] == "incomplete_proposal"

@@ -1,7 +1,8 @@
-"""Nagare's rule-based scheduling and rescheduling flow.
+"""Nagare's agentic scheduling and rescheduling flow.
 
-The planner proposes a schedule and the validator checks it. The runner's
-state machine supplies the agentic back-edge when validation finds a conflict.
+An optional model planner proposes a typed schedule, the validator checks it,
+and the runner supplies the bounded back-edge for revisions and escalation.
+Without a model call, the deterministic planner remains available offline.
 """
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ import json
 from types import SimpleNamespace
 
 from slice import callback
+from slice.llm import ModelError
 from slice.records import RunState
 
 from .schema import (
@@ -28,9 +30,13 @@ MAX_REVISIONS = 2
 
 def build_draft_messages(context: dict, prior: dict | None,
                          validation: dict | None, answer: dict | None) -> list[dict]:
-    """Build an inspectable planner request for future model integration."""
+    """Build a compact, inspectable request for the schedule planner agent."""
     return [
-        {"role": "system", "content": "Build a schedule from the supplied constraints."},
+        {"role": "system", "content": (
+            "You are Nagare's scheduling planner. Return only the requested JSON "
+            "schedule. Use only feasible available windows, preserve locked blocks, "
+            "schedule each task when possible, and keep reasoning under 160 characters."
+        )},
         {"role": "user", "content": json.dumps(
             {"context": context, "previous_schedule": prior,
              "validation": validation, "answer": answer},
@@ -52,10 +58,10 @@ def build_check_messages(context: dict, schedule: dict) -> list[dict]:
 
 
 def build_flow(call=None):
-    """Return a deterministic Nagare Flow.
+    """Return Nagare's bounded agentic flow.
 
-    ``call`` remains accepted for compatibility with the smoke-flow shape, but
-    rule-based planning and validation do not make model calls.
+    ``call`` is injected for live model use and testing. Omitting it selects the
+    offline deterministic planner; validation and escalation stay in code.
     """
 
     def _input(ctx) -> dict:
@@ -142,38 +148,127 @@ def build_flow(call=None):
             )
             return RunState.FAILED
 
+        if answer_text and "tomorrow" in answer_text and "task" in answer_text:
+            schedule = ctx.latest("proposed_schedule") or {"blocks": []}
+            validation = ctx.latest("validation") or {
+                "status": "BLOCK", "conflicts": []}
+            ctx.append(
+                "decision",
+                {
+                    "status": "scheduled",
+                    "schedule": schedule,
+                    "validation": validation,
+                    "explanation": (
+                        "The user authorized deferring the conflicting task "
+                        "to tomorrow."
+                    ),
+                },
+                produced_by="user_decision",
+            )
+            return RunState.COMPLETE
+
         tasks, profile, existing = _models(ctx)
         missed_task_id = payload.get(
             "missed_task_id") or payload.get("block_id")
-        missed_task = next(
-            (task for task in tasks if task.id == missed_task_id), None)
-        if missed_task is not None:
-            schedule = reschedule_task(
-                missed_task,
-                missed_task.estimated_duration,
-                existing,
-                tasks,
-                profile,
-            )
+        context = {
+            "tasks": [task.model_dump(mode="json") for task in tasks],
+            "profile": profile.model_dump(mode="json"),
+            "existing_blocks": [
+                block.model_dump(mode="json") for block in existing
+            ],
+            "missed_task_id": missed_task_id,
+            "reason": payload.get("reason"),
+        }
+        prior = ctx.latest("proposed_schedule")
+        validation = ctx.latest("validation")
+
+        def offline_schedule() -> ProposedSchedule:
+            missed_task = next(
+                (task for task in tasks if task.id == missed_task_id), None)
+            if missed_task is not None:
+                return reschedule_task(
+                    missed_task,
+                    missed_task.estimated_duration,
+                    existing,
+                    tasks,
+                    profile,
+                )
+            return baseline_schedule(tasks, profile)
+
+        used_agent = call is not None
+        if used_agent:
+            try:
+                schedule = call(
+                    settings=ctx.settings,
+                    budget=ctx.budget,
+                    messages=build_draft_messages(
+                        context, prior, validation, answer,
+                    ),
+                    schema=ProposedSchedule,
+                    step="nagare_draft",
+                )
+            except ModelError as exc:
+                ctx.append(
+                    "agent_fallback",
+                    {"kind": type(exc).__name__, "detail": str(exc)},
+                    produced_by="system",
+                )
+                schedule = offline_schedule()
+                used_agent = False
         else:
-            schedule = baseline_schedule(tasks, profile)
+            schedule = offline_schedule()
+
+        if used_agent:
+            feasible = offline_schedule()
+            proposed_task_ids = {
+                block.task_id
+                for block in schedule.blocks
+                if block.block_type == "task" and block.task_id is not None
+            }
+            feasible_task_ids = {
+                block.task_id
+                for block in feasible.blocks
+                if block.block_type == "task" and block.task_id is not None
+            }
+            if feasible_task_ids - proposed_task_ids:
+                ctx.append(
+                    "agent_fallback",
+                    {
+                        "kind": "incomplete_proposal",
+                        "detail": (
+                            "The agent omitted tasks that fit the supplied "
+                            "availability; used the feasible fallback schedule."
+                        ),
+                    },
+                    produced_by="system",
+                )
+                schedule = feasible
+                used_agent = False
 
         ctx.append(
             "proposed_schedule",
             schedule.model_dump(mode="json"),
-            produced_by="planner:rule_based",
+            produced_by=(
+                "agent:nagare_draft" if used_agent else "planner:offline"
+            ),
         )
         ctx.append(
             "reschedule_attempt",
             RescheduleAttempt(
                 attempt_number=len(ctx.history("reschedule_attempt")) + 1,
-                reason="Place tasks by deadline, priority, and available windows.",
+                reason=(
+                    "Agent proposed a schedule from the supplied constraints."
+                    if used_agent
+                    else "Offline planner placed tasks by deadline, priority, and availability."
+                ),
                 changes=[
                     "Generated a deterministic schedule from current constraints."],
                 conflicts_found=[],
                 outcome="unresolved",
             ).model_dump(mode="json"),
-            produced_by="planner:rule_based",
+            produced_by=(
+                "agent:nagare_draft" if used_agent else "planner:offline"
+            ),
         )
         return RunState.GATING
 

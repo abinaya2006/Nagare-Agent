@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from .planner import _overlaps, _protected
 from .schema import (
     Conflict,
@@ -12,6 +14,25 @@ def validate_schedule(
     locked_blocks,
 ):
     conflicts = []
+
+    def available_minutes_before_deadline(task):
+        if task.deadline is None:
+            return 0
+        total = 0
+        for window in profile.available_windows:
+            end = min(window.end, task.deadline)
+            if end <= window.start:
+                continue
+            cursor = window.start
+            while cursor < end:
+                next_cursor = min(cursor + timedelta(minutes=15), end)
+                if not _protected(cursor, next_cursor, profile) and not any(
+                    _overlaps(cursor, next_cursor, block)
+                    for block in locked_blocks
+                ):
+                    total += int((next_cursor - cursor).total_seconds() // 60)
+                cursor = next_cursor
+        return total
 
     by_id = {
         task.id: task
@@ -28,16 +49,28 @@ def validate_schedule(
         if task.id in scheduled_task_ids:
             continue
 
+        conflict_type = "unresolved_constraint"
+        explanation = (
+            f"Task '{task.title}' could not be placed in the "
+            "available time without violating a constraint."
+        )
+        available_minutes = available_minutes_before_deadline(task)
+        if task.deadline and 0 < available_minutes < task.estimated_duration:
+            conflict_type = "fragmentation"
+            explanation = (
+                f"Task '{task.title}' has {available_minutes} usable minutes "
+                f"before its {task.deadline.strftime('%H:%M')} deadline, but "
+                f"needs {task.estimated_duration} minutes. Ask whether to "
+                "split it into smaller sessions."
+            )
+
         conflicts.append(
             Conflict(
                 task_id=task.id,
-                conflict_type="unresolved_constraint",
+                conflict_type=conflict_type,
                 severity=task.consequence_of_delay,
                 resolvable=True,
-                explanation=(
-                    f"Task '{task.title}' could not be placed in the "
-                    "available time without violating a constraint."
-                ),
+                explanation=explanation,
             )
         )
 
