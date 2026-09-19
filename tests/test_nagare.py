@@ -142,6 +142,20 @@ def test_validator_passes_a_valid_schedule():
     assert result.conflicts == []
 
 
+def test_validator_blocks_tasks_missing_from_proposed_schedule():
+    user_profile = profile(window(9, 10))
+    scheduled = baseline_schedule([task(duration=90)], user_profile)
+
+    result = validate_schedule(
+        scheduled, [task(duration=90)], user_profile, [])
+
+    assert result.status == "BLOCK"
+    assert any(
+        conflict.conflict_type == "unresolved_constraint"
+        for conflict in result.conflicts
+    )
+
+
 def test_validator_blocks_overlapping_tasks():
     user_profile = profile(window(9, 17))
     scheduled = type("Schedule", (), {"blocks": [

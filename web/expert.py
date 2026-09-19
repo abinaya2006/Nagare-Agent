@@ -30,13 +30,16 @@ from __future__ import annotations
 
 import html
 import os
+from datetime import date, datetime, time, timedelta, timezone
 
-from fastapi import Form, Request
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi import FastAPI
 
-from slice import callback
-from slice.config import settings
+from demo.nagare.flow import build_flow
+from demo.nagare.schema import CircadianProfile, Task, TimeWindow, UserScheduleProfile
+from slice import callback, runner
+from slice.config import settings as load_settings
+from slice.records import RunState
 from slice.store import Store
 
 DB = os.environ.get("SLICE_DB", "run.db")
@@ -47,33 +50,242 @@ def _store() -> Store:
     return Store(DB)
 
 
+def _datetime(day: str, value: str) -> datetime:
+    return datetime.combine(date.fromisoformat(day), time.fromisoformat(value))
+
+
+def _profile(day: str, available_start: str, available_end: str,
+             morning_energy: int, afternoon_energy: int,
+             evening_energy: int) -> UserScheduleProfile:
+    start = _datetime(day, available_start)
+    end = _datetime(day, available_end)
+    noon = _datetime(day, "12:00")
+    peak_end = min(end, noon) if start < noon else end
+    return UserScheduleProfile(
+        available_windows=[TimeWindow(start=start, end=end)],
+        circadian_profile=CircadianProfile(
+            morning_energy=morning_energy,
+            afternoon_energy=afternoon_energy,
+            evening_energy=evening_energy,
+            peak_periods=[TimeWindow(start=start, end=peak_end)],
+        ),
+        preferred_work_periods=[TimeWindow(start=start, end=peak_end)],
+        protected_blocks=[],
+        preferred_session_length=60,
+        preferred_break_length=15,
+        sleep_window=TimeWindow(
+            start=_datetime(day, "23:00"),
+            end=_datetime(day, "23:00") + timedelta(hours=8),
+        ),
+        commute_windows=[],
+    )
+
+
+def _tasks(day: str, raw_tasks: str, available_start: str) -> list[Task]:
+    parsed = []
+    for index, line in enumerate(raw_tasks.splitlines(), 1):
+        parts = [part.strip() for part in line.split("|")]
+        if not parts or not parts[0]:
+            continue
+        if len(parts) < 2:
+            raise ValueError(
+                "Each task must use: title | minutes | priority | deadline")
+        duration = int(parts[1])
+        priority = int(parts[2]) if len(parts) > 2 and parts[2] else 3
+        deadline = _datetime(day, parts[3]) if len(
+            parts) > 3 and parts[3] else None
+        parsed.append(Task(
+            id=f"task-{index:03d}",
+            title=parts[0],
+            estimated_duration=duration,
+            priority=priority,
+            consequence_of_delay=priority,
+            energy_required=min(priority, 5),
+            earliest_start=_datetime(day, available_start),
+            deadline=deadline,
+            deadline_type="hard" if deadline else "none",
+        ))
+    if not parsed:
+        raise ValueError("Add at least one task.")
+    return parsed
+
+
+def _run_schedule(payload: dict) -> tuple[str, RunState]:
+    store = _store()
+    run_id = store.create_run("nagare")
+    store.append(run_id, "input", payload, produced_by="web_user")
+    return run_id, runner.advance(store, run_id, build_flow(), load_settings())
+
+
+def _schedule_html(run_id: str) -> str:
+    store = _store()
+    state = store.get_state(run_id)
+    input_data = store.latest(run_id, "input") or {}
+    schedule = store.latest(run_id, "proposed_schedule") or {}
+    tasks = {task["id"]: task for task in input_data.get("tasks", [])}
+    rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(block['start'][11:16])} - {html.escape(block['end'][11:16])}</td>"
+        f"<td>{html.escape(tasks.get(block.get('task_id'), {}).get('title', block.get('block_type', 'block')))}</td>"
+        f"<td>{'Locked' if block.get('locked') else 'Movable'}</td></tr>"
+        for block in schedule.get("blocks", [])
+    ) or "<tr><td colspan='3'>No task could be placed in the available windows.</td></tr>"
+    options = "".join(
+        f"<option value='{html.escape(task_id)}'>{html.escape(task['title'])}</option>"
+        for task_id, task in tasks.items()
+    )
+    pending = callback.pending(store, run_id)
+    decision = ""
+    if pending:
+        question = pending[0]
+        decision = (
+            "<div class='card'><h2>Your decision is needed</h2>"
+            f"<p class='sub'>{html.escape(question.question)}</p>"
+            f"<a class='nav-link' href='/q/{html.escape(question.id)}'>Answer this decision</a></div>"
+        )
+    return (
+        f"<h1>Your schedule</h1><p class='sub'>Run {html.escape(run_id)} · "
+        f"Status: <span class='status'>{html.escape(state.value)}</span></p>"
+        f"{decision}"
+        "<div class='card'><table><thead><tr><th>Time</th><th>Task</th><th>Status</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table></div>"
+        "<div class='card'><h2>Something changed?</h2>"
+        f"<form method='post' action='/runs/{html.escape(run_id)}/reschedule'>"
+        f"<label>Missed task<select name='task_id'>{options}</select></label>"
+        "<label>What happened?<input name='reason' placeholder='Lab ran late'></label>"
+        "<button type='submit'>Reschedule task</button></form></div>"
+        "<p><a href='/schedule'>Create another schedule</a> · <a href='/'>Pending decisions</a></p>"
+    )
+
+
 PAGE = """<!doctype html><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <style>
-:root{{color-scheme:light dark}}
-body{{font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;max-width:38rem;
-margin:0 auto;padding:2rem 1.2rem 4rem}}
-h1{{font-size:1.35rem;margin:0 0 .3rem}}
-.sub{{color:#6b7280;font-size:.9rem;margin:0 0 1.8rem}}
-.card{{border:1px solid #d4d4d8;border-radius:8px;padding:1.1rem 1.2rem;margin:0 0 1rem}}
+ :root{{color-scheme:light;--ink:#173b3d;--muted:#667577;--paper:#f6f2e9;
+--panel:#fffdf8;--line:#d9dfd6;--teal:#0c6664;--teal-dark:#084c4b;
+--coral:#d86f52;--shadow:0 18px 50px rgba(26,62,58,.08)}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 "Trebuchet MS","Segoe UI",sans-serif}}
+.shell{{max-width:58rem;margin:0 auto;padding:2rem 1.25rem 4rem}}
+.masthead{{display:flex;align-items:center;justify-content:space-between;margin-bottom:3.2rem}}
+.brand{{display:flex;align-items:center;gap:.7rem;color:var(--ink);font-weight:700;letter-spacing:.04em}}
+.brand-mark{{display:grid;place-items:center;width:2.35rem;height:2.35rem;border-radius:12px;
+background:var(--teal);color:#fff;font-family:Georgia,serif;font-size:1.35rem}}
+.brand small{{display:block;color:var(--muted);font-size:.68rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase}}
+.nav-link{{font-size:.82rem;font-weight:700;text-decoration:none;color:var(--teal)}}
+h1{{font-family:Georgia,"Times New Roman",serif;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;
+letter-spacing:-.02em;margin:0 0 .7rem;color:var(--ink)}}
+h2{{font-size:1.05rem;margin:0 0 .75rem;color:var(--ink)}}
+.sub{{color:var(--muted);font-size:1rem;max-width:42rem;margin:0 0 1.8rem}}
+.card{{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.25rem 1.35rem;
+margin:0 0 1rem;box-shadow:var(--shadow)}}
 .q{{font-size:1.1rem;font-weight:600;margin:0 0 .8rem}}
-.ctx{{background:rgba(127,127,127,.09);border-radius:6px;padding:.8rem 1rem;
+.ctx{{background:#eef3ed;border-radius:9px;padding:.8rem 1rem;
 font-size:.9rem;margin:0 0 1.2rem;white-space:pre-wrap;overflow-wrap:anywhere}}
 .ctx b{{display:block;font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;
-color:#6b7280;margin-bottom:.35rem;font-weight:600}}
-textarea{{width:100%;min-height:9rem;font:inherit;padding:.7rem;border:1px solid #a1a1aa;
-border-radius:6px;background:transparent;color:inherit}}
-button{{font:inherit;font-weight:600;padding:.6rem 1.4rem;margin-top:.8rem;
-border:0;border-radius:6px;background:#0d5c5f;color:#fff;cursor:pointer}}
-a{{color:#0d5c5f}} .empty{{color:#6b7280}}
-.note{{font-size:.85rem;color:#6b7280;margin-top:1.2rem}}
+color:var(--muted);margin-bottom:.35rem;font-weight:600}}
+textarea{{width:100%;min-height:10rem;font:inherit;padding:.85rem;border:1px solid #b9c8be;
+border-radius:9px;background:#fff;color:var(--ink);resize:vertical}}
+button{{font:inherit;font-weight:700;padding:.72rem 1.15rem;margin-top:.8rem;
+border:0;border-radius:8px;background:var(--teal);color:#fff;cursor:pointer;box-shadow:0 6px 14px rgba(12,102,100,.18)}}
+button:hover{{background:var(--teal-dark)}}
+a{{color:var(--teal)}} .empty{{color:var(--muted)}}
+label{{display:block;font-weight:700;margin:.9rem 0;color:var(--ink);font-size:.9rem}}
+input,select{{display:block;width:100%;font:inherit;padding:.72rem;margin-top:.35rem;
+border:1px solid #b9c8be;border-radius:9px;background:#fff;color:var(--ink)}}
+input:focus,select:focus,textarea:focus{{outline:3px solid rgba(216,111,82,.22);border-color:var(--coral)}}
+table{{width:100%;border-collapse:collapse;font-size:.94rem}}
+th,td{{text-align:left;padding:.8rem .55rem;border-bottom:1px solid var(--line)}}
+th{{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}}
+td:first-child{{font-weight:700;white-space:nowrap;color:var(--teal)}}
+.hint{{font-size:.85rem;color:var(--muted);margin:.25rem 0 1rem}}
+.error{{color:#8d3328;background:#fae3da;border-radius:9px;padding:.8rem 1rem}}
+.note{{font-size:.85rem;color:var(--muted);margin-top:1.2rem}}
+.status{{display:inline-block;padding:.22rem .55rem;border-radius:999px;background:#e5f2ea;color:#17634c;
+font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em}}
+.footer{{margin-top:2rem;color:var(--muted);font-size:.75rem}}
+@media (max-width:560px){{.shell{{padding:1.1rem .9rem 3rem}}.masthead{{margin-bottom:2.1rem}}
+.card{{padding:1rem}}table{{font-size:.82rem}}th,td{{padding:.65rem .25rem}}}}
 </style>
-{body}"""
+<div class="shell"><header class="masthead"><a class="brand" href="/"><span class="brand-mark">N</span><span>NAGARE<small>daily flow planner</small></span></a><a class="nav-link" href="/schedule">New schedule +</a></header>{body}<p class="footer">Nagare plans around your constraints, not against them.</p></div>"""
 
 
 def _page(title: str, body: str) -> HTMLResponse:
     return HTMLResponse(PAGE.format(title=html.escape(title), body=body))
+
+
+@app.get("/schedule", response_class=HTMLResponse)
+def schedule_form():
+    return _page(
+        "Build your schedule",
+        "<h1>Build your schedule</h1>"
+        "<p class='sub'>Tell Nagare when you are available and what needs to get done.</p>"
+        "<form method='post' action='/schedule'>"
+        f"<label>Date<input type='date' name='day' value='{datetime.now(timezone.utc).date().isoformat()}' required></label>"
+        "<label>Available from<input type='time' name='available_start' value='09:00' required></label>"
+        "<label>Available until<input type='time' name='available_end' value='21:00' required></label>"
+        "<label>Morning energy (0-5)<input type='number' name='morning_energy' min='0' max='5' value='5' required></label>"
+        "<label>Afternoon energy (0-5)<input type='number' name='afternoon_energy' min='0' max='5' value='3' required></label>"
+        "<label>Evening energy (0-5)<input type='number' name='evening_energy' min='0' max='5' value='2' required></label>"
+        "<label>Tasks<textarea name='tasks' required placeholder='Task title | minutes | priority | deadline\nStudy networks | 90 | 3 | 18:00\nReply to email | 30 | 2'></textarea></label>"
+        "<p class='hint'>One task per line. Deadline is optional and uses HH:MM. Priority is 1 (low) to 5 (high).</p>"
+        "<button type='submit'>Generate schedule</button></form>"
+        "<p><a href='/'>Pending decisions</a></p>",
+    )
+
+
+@app.post("/schedule", response_class=HTMLResponse)
+def create_schedule(
+    day: str = Form(...),
+    available_start: str = Form(...),
+    available_end: str = Form(...),
+    morning_energy: int = Form(...),
+    afternoon_energy: int = Form(...),
+    evening_energy: int = Form(...),
+    tasks: str = Form(...),
+):
+    try:
+        profile = _profile(
+            day, available_start, available_end,
+            morning_energy, afternoon_energy, evening_energy,
+        )
+        parsed_tasks = _tasks(day, tasks, available_start)
+        run_id, _ = _run_schedule({
+            "profile": profile.model_dump(mode="json"),
+            "tasks": [task.model_dump(mode="json") for task in parsed_tasks],
+            "existing_blocks": [],
+        })
+        return _page("Schedule ready", _schedule_html(run_id))
+    except (ValueError, TypeError) as exc:
+        return _page(
+            "Schedule input error",
+            "<h1>Could not build that schedule</h1>"
+            f"<p class='error'>{html.escape(str(exc))}</p>"
+            "<p><a href='/schedule'>Back to schedule form</a></p>",
+        )
+
+
+@app.post("/runs/{run_id}/reschedule", response_class=HTMLResponse)
+def reschedule(run_id: str, task_id: str = Form(...), reason: str = Form("")):
+    store = _store()
+    try:
+        payload = store.latest(run_id, "input")
+        schedule = store.latest(run_id, "proposed_schedule")
+        if payload is None or schedule is None:
+            raise ValueError("That schedule run no longer exists.")
+        payload["existing_blocks"] = schedule.get("blocks", [])
+        payload["missed_task_id"] = task_id
+        payload["reason"] = reason.strip() or "The task was interrupted."
+        new_run_id, _ = _run_schedule(payload)
+        return _page("Schedule updated", _schedule_html(new_run_id))
+    except (KeyError, ValueError, TypeError) as exc:
+        return _page(
+            "Reschedule error",
+            "<h1>Could not reschedule that task</h1>"
+            f"<p class='error'>{html.escape(str(exc))}</p>"
+            "<p><a href='/schedule'>Create a new schedule</a></p>",
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -87,14 +299,16 @@ def index():
                      "<p class='sub'>NANI isn't stuck on anything right now.</p>"
                      "<p class='empty'>This page will have something on it when a "
                      "schedule conflict can't be resolved without your say-so - a hard "
-                     "deadline with no safe window, say.</p>")
+                     "deadline with no safe window, say.</p>"
+                     "<p><a href='/schedule'>Build a schedule</a></p>")
     items = "".join(
         f"<div class='card'><p class='q'>{html.escape(q.question)}</p>"
         f"<a href='/q/{q.id}'>Sort this out &rarr;</a></div>" for q in open_qs)
     return _page("NANI needs a decision",
                  f"<h1>{len(open_qs)} thing(s) NANI can't decide alone</h1>"
                  "<p class='sub'>Your schedule hit a conflict NANI won't guess its way "
-                 "through. Your answer picks up planning right where it stopped.</p>" + items)
+                 "through. Your answer picks up planning right where it stopped.</p>" + items +
+                 "<p><a href='/schedule'>Build a new schedule</a></p>")
 
 
 @app.get("/q/{qid}", response_class=HTMLResponse)
@@ -112,7 +326,7 @@ def show(qid: str):
     for k, v in (q.context or {}).items():
         if k == "resume_state":
             continue
-        ctx += (f"<div class='ctx'><b>{html.escape(str(k).replace('_',' '))}</b>"
+        ctx += (f"<div class='ctx'><b>{html.escape(str(k).replace('_', ' '))}</b>"
                 f"{html.escape(str(v))}</div>")
     return _page("A call only you can make",
                  f"<h1>A call only you can make</h1>"

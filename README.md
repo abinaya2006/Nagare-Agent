@@ -213,6 +213,10 @@ http://localhost:8000/q/<QUESTION_ID>
 
 5. The run will resume after the answer is posted and persisted.
 
+### Basic browser UI
+
+The FastAPI app also includes a basic user intake page at [http://localhost:8000/schedule](http://localhost:8000/schedule). The user enters available time, energy levels, and tasks using `title | minutes | priority | deadline`. Nagare generates the schedule, displays the result, and provides a reschedule form for a missed task. Rescheduling creates a new persisted run using the previous schedule as occupied context.
+
 ### Test commands
 
 Run the focused Nagare tests:

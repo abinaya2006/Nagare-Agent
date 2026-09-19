@@ -73,6 +73,8 @@ def build_flow(call=None):
         return tasks, profile, existing
 
     def _conflict_signature(conflict: dict) -> tuple:
+        if not isinstance(conflict, dict):
+            conflict = conflict.model_dump()
         return (
             conflict.get("task_id"),
             conflict.get("conflicting_block_id"),

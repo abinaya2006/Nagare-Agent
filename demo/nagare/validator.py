@@ -18,6 +18,29 @@ def validate_schedule(
         for task in tasks
     }
 
+    scheduled_task_ids = {
+        block.task_id
+        for block in schedule.blocks
+        if block.block_type == "task" and block.task_id is not None
+    }
+
+    for task in tasks:
+        if task.id in scheduled_task_ids:
+            continue
+
+        conflicts.append(
+            Conflict(
+                task_id=task.id,
+                conflict_type="unresolved_constraint",
+                severity=task.consequence_of_delay,
+                resolvable=True,
+                explanation=(
+                    f"Task '{task.title}' could not be placed in the "
+                    "available time without violating a constraint."
+                ),
+            )
+        )
+
     # --------------------------------------------------
     # 1. Validate every scheduled task
     # --------------------------------------------------
