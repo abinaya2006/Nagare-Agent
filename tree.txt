@@ -22,11 +22,13 @@
 │   │   │   ├── schema.cpython-312.pyc
 │   │   │   └── stub.cpython-312.pyc
 │   │   ├── flow.py
+│   │   ├── planner.py
 │   │   ├── prompts
 │   │   │   ├── gate.md
 │   │   │   └── spot.md
 │   │   ├── schema.py
-│   │   └── stub.py
+│   │   ├── stub.py
+│   │   └── validator.py
 │   └── smoke
 │       ├── SMOKE-SPEC.md
 │       ├── __init__.py
@@ -59,6 +61,7 @@
 │   └── VERIFIER.md
 ├── pytest.ini
 ├── requirements.txt
+├── run.db
 ├── scripts
 │   ├── bakeoff.py
 │   ├── doctor.py
@@ -102,6 +105,9 @@
 ├── tree.txt
 └── web
     ├── __init__.py
+    ├── __pycache__
+    │   ├── __init__.cpython-312.pyc
+    │   └── expert.cpython-312.pyc
     └── expert.py
 
-18 directories, 87 files
+19 directories, 92 files
