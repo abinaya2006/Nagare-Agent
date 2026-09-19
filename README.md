@@ -24,6 +24,12 @@ Nagare is designed to handle:
 
 This is a rule-based scheduling agent with an explicit validation gate and a human back-edge.
 
+Nagare also includes a selected-task focus workflow. The user chooses one task
+from their pending queue, Nagare recommends one manageable focus block, and the
+user accepts, rejects, or skips it. Rejection reasons and breakdown decisions
+are stored across runs so later recommendations can adapt. See
+[docs/NAGARE-FOCUS-SPEC.md](docs/NAGARE-FOCUS-SPEC.md).
+
 ---
 
 ## Core workflow
@@ -136,6 +142,7 @@ python demo/terminal.py --run
 python demo/terminal.py --miss task-001
 python demo/terminal.py --pending
 python demo/terminal.py --replay <RUN_ID>
+python demo/terminal.py --focus
 ```
 
 1. Start the human-answer app:
@@ -143,6 +150,10 @@ python demo/terminal.py --replay <RUN_ID>
 ```bash
 uvicorn web.expert:app --host 0.0.0.0 --port 8000
 ```
+
+Open `http://localhost:8000/focus` to enter pending tasks, select one, and run
+the Focus Agent workflow. The existing schedule workflow remains at
+`http://localhost:8000/schedule`.
 
 2. In another terminal, run the scheduler or trigger a run from the repo logic:
 

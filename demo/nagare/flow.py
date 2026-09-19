@@ -20,7 +20,7 @@ from .schema import (
     Task,
     UserScheduleProfile,
 )
-from .planner import baseline_schedule, reschedule_task
+from .planner import baseline_schedule, fragment_task, reschedule_task
 from .validator import validate_schedule
 
 
@@ -100,7 +100,7 @@ def build_flow(call=None):
         )
         question = (
             "A task cannot fit as one session before its deadline. Should I "
-            "split it into smaller sessions, or move something else to tomorrow?"
+            "fragment it into smaller sessions, or move something else to tomorrow?"
             if has_fragmentation else
             "I couldn't find a safe slot without breaking rules. How should I resolve this? "
             "(e.g., 'Move task X to tomorrow', 'Shorten task Y to 30 mins', 'Split it up')"
@@ -138,6 +138,68 @@ def build_flow(call=None):
         missed_task_id = payload.get(
             "missed_task_id") or payload.get("block_id")
 
+        # Keep the offline path useful for terminal demos and tests. In AI mode
+        # the same answer is forwarded to the model below for interpretation.
+        if answer_text and not call:
+            if "fragment" in answer_text or "split" in answer_text:
+                conflict_ids = {
+                    item.get("task_id")
+                    for item in (ctx.latest("validation") or {}).get("conflicts", [])
+                    if item.get("conflict_type") == "fragmentation"
+                }
+                task_to_fragment = next(
+                    (item for item in tasks if item.id in conflict_ids), None)
+                if task_to_fragment is not None:
+                    ctx.append(
+                        "proposed_schedule",
+                        fragment_task(task_to_fragment, profile,
+                                      existing).model_dump(mode="json"),
+                        produced_by="planner:offline_fragmentation",
+                    )
+                    return RunState.GATING
+
+            if "shorten" in answer_text:
+                import re
+                duration_match = re.search(
+                    r"\b(?:to|for)\s+(\d+)\s*(?:minutes?|mins?)?", answer_text)
+                if duration_match:
+                    shortened_duration = int(duration_match.group(1))
+                    conflict = next(
+                        (
+                            item for item in (ctx.latest("validation") or {}).get("conflicts", [])
+                            if item.get("task_id")
+                        ),
+                        None,
+                    )
+                    task_id = conflict.get(
+                        "task_id") if conflict else missed_task_id
+                    tasks = [
+                        item.model_copy(update={
+                            "estimated_duration": shortened_duration
+                        }) if item.id == task_id else item
+                        for item in tasks
+                    ]
+                    payload = dict(payload)
+                    payload["tasks"] = [item.model_dump(
+                        mode="json") for item in tasks]
+                    ctx.append("input", payload, produced_by="user_decision")
+
+            if "tomorrow" in answer_text and "task" in answer_text:
+                schedule = ctx.latest("proposed_schedule") or {"blocks": []}
+                validation = ctx.latest("validation") or {
+                    "status": "BLOCK", "conflicts": []}
+                ctx.append(
+                    "decision",
+                    {
+                        "status": "scheduled",
+                        "schedule": schedule,
+                        "validation": validation,
+                        "explanation": "The user authorized deferring the conflicting task to tomorrow.",
+                    },
+                    produced_by="user_decision",
+                )
+                return RunState.COMPLETE
+
         context = {
             "tasks": [task.model_dump(mode="json") for task in tasks],
             "profile": profile.model_dump(mode="json"),
@@ -153,7 +215,14 @@ def build_flow(call=None):
             missed_task = next(
                 (t for t in tasks if t.id == missed_task_id), None)
             if missed_task is not None:
-                return reschedule_task(missed_task, missed_task.estimated_duration, existing, tasks, profile)
+                return reschedule_task(
+                    missed_task,
+                    missed_task.estimated_duration,
+                    existing,
+                    tasks,
+                    profile,
+                    excluded_block_id=missed_task.id,
+                )
             return baseline_schedule(tasks, profile)
 
         used_agent = call is not None

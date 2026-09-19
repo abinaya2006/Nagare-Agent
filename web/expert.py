@@ -36,6 +36,7 @@ from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from demo.nagare.flow import build_flow
+from demo.nagare.focus import FocusTask, build_focus_flow
 from demo.nagare.schema import CircadianProfile, Task, TimeWindow, UserScheduleProfile
 from slice import callback, runner
 from slice.config import settings as load_settings
@@ -56,7 +57,8 @@ def _datetime(day: str, value: str) -> datetime:
 
 def _profile(day: str, available_start: str, available_end: str,
              morning_energy: int, afternoon_energy: int,
-             evening_energy: int) -> UserScheduleProfile:
+             evening_energy: int,
+             protected_blocks: list[TimeWindow] | None = None) -> UserScheduleProfile:
 
     start_today = _datetime(day, available_start)
     end_today = _datetime(day, available_end)
@@ -64,30 +66,20 @@ def _profile(day: str, available_start: str, available_end: str,
     peak_end_today = min(
         end_today, noon_today) if start_today < noon_today else end_today
 
-    # CRITICAL FIX: Give the AI mathematical space for "Tomorrow"
-    start_tomorrow = start_today + timedelta(days=1)
-    end_tomorrow = end_today + timedelta(days=1)
-    peak_end_tomorrow = peak_end_today + timedelta(days=1)
-
     return UserScheduleProfile(
         available_windows=[
             TimeWindow(start=start_today, end=end_today),
-            TimeWindow(start=start_tomorrow, end=end_tomorrow)
         ],
         circadian_profile=CircadianProfile(
             morning_energy=morning_energy,
             afternoon_energy=afternoon_energy,
             evening_energy=evening_energy,
-            peak_periods=[
-                TimeWindow(start=start_today, end=peak_end_today),
-                TimeWindow(start=start_tomorrow, end=peak_end_tomorrow)
-            ],
+            peak_periods=[TimeWindow(start=start_today, end=peak_end_today)],
         ),
         preferred_work_periods=[
             TimeWindow(start=start_today, end=peak_end_today),
-            TimeWindow(start=start_tomorrow, end=peak_end_tomorrow)
         ],
-        protected_blocks=[],
+        protected_blocks=protected_blocks or [],
         preferred_session_length=60,
         preferred_break_length=15,
         sleep_window=TimeWindow(
@@ -96,6 +88,20 @@ def _profile(day: str, available_start: str, available_end: str,
         ),
         commute_windows=[],
     )
+
+
+def _protected_blocks(day: str, raw_blocks: str) -> list[TimeWindow]:
+    parsed = []
+    for line in raw_blocks.splitlines():
+        parts = [part.strip() for part in line.split("|", 2)]
+        if not parts or not parts[0]:
+            continue
+        if len(parts) != 3:
+            raise ValueError("Protected moments must use: name | start | end")
+        start = _datetime(day, parts[1])
+        end = _datetime(day, parts[2])
+        parsed.append(TimeWindow(start=start, end=end))
+    return parsed
 
 
 def _tasks(day: str, raw_tasks: str, available_start: str) -> list[Task]:
@@ -134,10 +140,227 @@ def _run_schedule(payload: dict) -> tuple[str, RunState]:
     store.append(run_id, "input", payload, produced_by="web_user")
     settings = load_settings()
     call = None
-    if os.environ.get("NAGARE_AGENT_MODE", "offline").lower() == "model" and settings.api_key:
+    if os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model" and settings.api_key:
         from slice.llm import complete
         call = complete
     return run_id, runner.advance(store, run_id, build_flow(call), settings)
+
+
+def _focus_model_call(settings):
+    if os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model" and settings.api_key:
+        from slice.llm import complete
+        return complete
+    return None
+
+
+def _run_focus(payload: dict) -> tuple[str, RunState]:
+    store = _store()
+    run_id = store.create_run("nagare_focus")
+    store.append(run_id, "input", payload, produced_by="web_user")
+    settings = load_settings()
+    return run_id, runner.advance(
+        store, run_id, build_focus_flow(_focus_model_call(settings)), settings)
+
+
+def _focus_html(run_id: str) -> str:
+    store = _store()
+    state = store.get_state(run_id)
+    payload = store.latest(run_id, "input") or {}
+    selected_id = payload.get("selected_task_id")
+    task = next(
+        (item for item in payload.get("tasks", [])
+         if item.get("id") == selected_id),
+        {"id": selected_id, "title": "Selected task"},
+    )
+    recommendation = store.latest(run_id, "focus_recommendation")
+    breakdown = store.latest(run_id, "breakdown_action")
+    pending = callback.pending(store, run_id)
+    decision = ""
+    if pending:
+        question = pending[0]
+        if question.context.get("kind") == "focus_decision":
+            decision_controls = (
+                f"<form method='post' action='/q/{html.escape(question.id)}' class='decision-actions'>"
+                "<input type='hidden' name='who' value='user'>"
+                "<button type='submit' name='answer' value='accept'>Accept</button>"
+                "<button type='submit' name='answer' value='reject' class='button-secondary'>Reject</button>"
+                "<button type='submit' name='answer' value='skip' class='button-quiet'>Skip</button></form>"
+            )
+        elif question.context.get("kind") == "breakdown_decision":
+            decision_controls = (
+                f"<form method='post' action='/q/{html.escape(question.id)}' class='decision-actions'>"
+                "<input type='hidden' name='who' value='user'>"
+                "<button type='submit' name='answer' value='start'>Start this step</button>"
+                "<button type='submit' name='answer' value='not useful' class='button-secondary'>Not useful</button></form>"
+            )
+        else:
+            decision_controls = f"<a class='nav-link' href='/q/{html.escape(question.id)}'>Write an answer</a>"
+        decision = (
+            "<div class='card decision-card'><p class='kicker'>Human checkpoint</p><h2>Your decision is needed</h2>"
+            f"<p class='q'>{html.escape(question.question)}</p>"
+            f"{decision_controls}</div>"
+        )
+    recommendation_html = ""
+    if recommendation:
+        recommendation_html = (
+            "<div class='card recommendation-card'><p class='kicker'>Nagare recommends</p><h2>Current recommendation</h2>"
+            f"<p class='q'>{html.escape(recommendation['recommendation'])}</p>"
+            f"<p class='sub'>{html.escape(recommendation['reason'])}</p></div>"
+        )
+    breakdown_html = ""
+    if breakdown:
+        breakdown_html = (
+            "<div class='card breakdown-card'><p class='kicker'>Make it smaller</p><h2>Smaller next action</h2>"
+            f"<p class='q'>{html.escape(breakdown['step'])}</p>"
+            f"<p class='sub'>{breakdown['estimated_minutes']} minutes. "
+            f"{html.escape(breakdown['completion_condition'])}</p></div>"
+        )
+    outcome = store.latest(run_id, "focus_outcome")
+    outcome_form = ""
+    if outcome and outcome.get("status", "").startswith("started"):
+        outcome_form = (
+            "<div class='card'><h2>When you finish</h2>"
+            f"<form method='post' action='/focus/runs/{html.escape(run_id)}/outcome'>"
+            "<select name='status'><option value='completed'>Completed</option>"
+            "<option value='partially_completed'>Partially completed</option>"
+            "<option value='not_completed'>Not completed</option></select>"
+            "<button type='submit'>Record outcome</button></form></div>"
+        )
+    return (
+        f"<h1>Focus with Nagare</h1><p class='sub'>Run {html.escape(run_id)} · "
+        f"Status: <span class='status'>{html.escape(state.value)}</span></p>"
+        f"<div class='card'><h2>Selected task</h2><p class='q'>{html.escape(task.get('title', ''))}</p>"
+        f"<p class='sub'>{html.escape(task.get('description') or '')}</p></div>"
+        f"{recommendation_html}{breakdown_html}{decision}{outcome_form}"
+        "<p><a href='/focus'>View pending queue</a> · <a href='/schedule'>Start a new schedule</a> · <a href='/'>Pending decisions</a></p>"
+    )
+
+
+def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
+    store = _store()
+    for run in store.list_runs(limit=100):
+        if run["domain"] != "nagare":
+            continue
+        payload = store.latest(run["id"], "input") or {}
+        schedule = store.latest(run["id"], "proposed_schedule") or {}
+        scheduled_ids = {
+            block.get("task_id") for block in schedule.get("blocks", [])
+            if block.get("block_type") == "task" and block.get("task_id")
+        }
+        pending = [
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "description": task.get("description"),
+                "deadline": task.get("deadline"),
+                "estimated_minutes": task["estimated_duration"],
+                "priority": task.get("priority", "medium"),
+                "status": "pending",
+            }
+            for task in payload.get("tasks", [])
+            if task.get("id") not in scheduled_ids
+        ]
+        return run["id"], pending
+    return None, []
+
+
+@app.get("/focus", response_class=HTMLResponse)
+def focus_form():
+    schedule_run_id, pending_tasks = _latest_schedule_queue()
+    if schedule_run_id is None:
+        return _page(
+            "Pending queue",
+            "<h1>Start with your schedule</h1>"
+            "<p class='sub'>Your pending queue is created from tasks that could not be placed in your latest schedule.</p>"
+            "<a class='nav-link' href='/schedule'>Set up today\'s schedule</a>",
+        )
+    if not pending_tasks:
+        return _page(
+            "Pending queue",
+            "<h1>Your pending queue is clear</h1>"
+            "<p class='sub'>Every task from the latest schedule was placed.</p>"
+            "<a class='nav-link' href='/schedule'>Start another schedule</a>",
+        )
+    options = "".join(
+        f"<option value='{html.escape(task['id'])}'>{html.escape(task['title'])} · "
+        f"{html.escape(str(task['estimated_minutes']))} min</option>"
+        for task in pending_tasks
+    )
+    return _page(
+        "Choose a focus task",
+        "<div class='focus-hero'><p class='kicker'>Your next move</p>"
+        "<h1>Your pending queue</h1>"
+        "<p class='sub'>These tasks were not placed in the latest schedule. The queue is read-only; choose one and Nagare will suggest how to begin.</p></div>"
+        "<form method='post' action='/focus' class='focus-form'>"
+        f"<input type='hidden' name='schedule_run_id' value='{html.escape(schedule_run_id)}'>"
+        "<div class='card'><p class='kicker'>Select one pending task</p>"
+        f"<label>Task<select name='selected_task_id' required>{options}</select></label>"
+        "<button type='submit'>Get my next step</button></div></form>"
+        "<p><a href='/'>Pending decisions</a></p>",
+    )
+
+
+@app.post("/focus", response_class=HTMLResponse)
+def create_focus(selected_task_id: str = Form(...), schedule_run_id: str = Form(...)):
+    try:
+        store = _store()
+        if store.get_domain(schedule_run_id) != "nagare":
+            raise ValueError("That schedule run is not a Nagare schedule.")
+        source = store.latest(schedule_run_id, "input") or {}
+        schedule = store.latest(schedule_run_id, "proposed_schedule") or {}
+        scheduled_ids = {
+            block.get("task_id") for block in schedule.get("blocks", [])
+            if block.get("block_type") == "task" and block.get("task_id")
+        }
+        parsed = [
+            {
+                "id": task["id"],
+                "title": task["title"],
+                "description": task.get("description"),
+                "deadline": task.get("deadline"),
+                "estimated_minutes": task["estimated_duration"],
+                "priority": task.get("priority", "medium"),
+                "status": "pending",
+            }
+            for task in source.get("tasks", [])
+            if task.get("id") not in scheduled_ids
+        ]
+        if selected_task_id not in {item["id"] for item in parsed}:
+            raise ValueError("Select a task from the read-only pending queue.")
+        run_id, _ = _run_focus(
+            {"tasks": parsed, "selected_task_id": selected_task_id,
+             "context": {"source_schedule_run_id": schedule_run_id}})
+        return _page("Focus recommendation", _focus_html(run_id))
+    except (ValueError, TypeError):
+        return _page(
+            "Focus input error",
+            "<h1>Could not start focus</h1>"
+            "<p class='error'>Check the task format and selected task ID.</p>"
+            "<p><a href='/focus'>Back to focus</a></p>",
+        )
+
+
+@app.get("/focus/runs/{run_id}", response_class=HTMLResponse)
+def show_focus_run(run_id: str):
+    try:
+        if _store().get_domain(run_id) != "nagare_focus":
+            raise KeyError(run_id)
+    except KeyError:
+        return _page("Not found", "<h1>Not found</h1><p class='sub'>No such focus run.</p>")
+    return _page("Focus recommendation", _focus_html(run_id))
+
+
+@app.post("/focus/runs/{run_id}/outcome", response_class=HTMLResponse)
+def record_focus_outcome(run_id: str, status: str = Form(...)):
+    store = _store()
+    if store.get_domain(run_id) != "nagare_focus":
+        return _page("Not found", "<h1>Not found</h1>")
+    if status not in {"completed", "partially_completed", "not_completed"}:
+        return _page("Invalid outcome", "<h1>Invalid outcome</h1>")
+    task_id = (store.latest(run_id, "input") or {}).get("selected_task_id")
+    store.append(run_id, "focus_outcome", {
+                 "task_id": task_id, "status": status}, produced_by="user")
+    return _page("Outcome recorded", _focus_html(run_id))
 
 # --- (The rest of the UI rendering code in web/expert.py remains identical) ---
 
@@ -211,6 +434,18 @@ body{{margin:0;background:var(--paper);color:var(--ink);font:16px/1.6 "Trebuchet
 background:var(--teal);color:#fff;font-family:Georgia,serif;font-size:1.35rem}}
 .brand small{{display:block;color:var(--muted);font-size:.68rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase}}
 .nav-link{{font-size:.82rem;font-weight:700;text-decoration:none;color:var(--teal)}}
+.focus-hero{{padding:1.8rem 0 1.2rem;border-top:4px solid var(--coral)}}
+.kicker{{margin:0 0 .35rem;color:var(--coral);font-size:.72rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase}}
+.focus-form{{max-width:42rem}}
+.recommendation-card{{border-left:5px solid var(--teal)}}
+.breakdown-card{{border-left:5px solid var(--coral)}}
+.decision-card{{background:#eef3ed;border-color:#b9c8be}}
+.decision-actions{{display:flex;flex-wrap:wrap;gap:.6rem;align-items:center}}
+.decision-actions button{{margin-top:0}}
+.button-secondary{{background:var(--coral)}}
+.button-secondary:hover{{background:#b6533d}}
+.button-quiet{{background:transparent;color:var(--teal);border:1px solid #9cb5ad;box-shadow:none}}
+.button-quiet:hover{{background:#e1ece7}}
 h1{{font-family:Georgia,"Times New Roman",serif;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;
 letter-spacing:-.02em;margin:0 0 .7rem;color:var(--ink)}}
 h2{{font-size:1.05rem;margin:0 0 .75rem;color:var(--ink)}}
@@ -245,7 +480,7 @@ font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em}}
 @media (max-width:560px){{.shell{{padding:1.1rem .9rem 3rem}}.masthead{{margin-bottom:2.1rem}}
 .card{{padding:1rem}}table{{font-size:.82rem}}th,td{{padding:.65rem .25rem}}}}
 </style>
-<div class="shell"><header class="masthead"><a class="brand" href="/"><span class="brand-mark">N</span><span>NAGARE<small>daily flow planner</small></span></a><a class="nav-link" href="/schedule">New schedule +</a></header>{body}<p class="footer">Nagare plans around your constraints, not against them.</p></div>"""
+<div class="shell"><header class="masthead"><a class="brand" href="/"><span class="brand-mark">N</span><span>NAGARE<small>daily flow planner</small></span></a><span><a class="nav-link" href="/focus">Focus</a> · <a class="nav-link" href="/schedule">Schedule</a></span></header>{body}<p class="footer">Nagare plans around your constraints, not against them.</p></div>"""
 
 
 def _page(title: str, body: str) -> HTMLResponse:
@@ -265,6 +500,8 @@ def schedule_form():
         "<label>Morning energy (0-5)<input type='number' name='morning_energy' min='0' max='5' value='5' required></label>"
         "<label>Afternoon energy (0-5)<input type='number' name='afternoon_energy' min='0' max='5' value='3' required></label>"
         "<label>Evening energy (0-5)<input type='number' name='evening_energy' min='0' max='5' value='2' required></label>"
+        "<label>Protected moments<textarea name='protected_blocks' placeholder='Lunch | 13:00 | 14:00\nGym | 18:00 | 19:00'></textarea></label>"
+        "<p class='hint'>Optional. One protected moment per line: name | start | end.</p>"
         "<label>Tasks<textarea name='tasks' required placeholder='Task title | minutes | priority | deadline\nStudy networks | 90 | 3 | 18:00\nReply to email | 30 | 2'></textarea></label>"
         "<p class='hint'>One task per line. Deadline is optional and uses HH:MM. Priority is 1 (low) to 5 (high).</p>"
         "<button type='submit'>Generate schedule</button></form>"
@@ -280,11 +517,14 @@ def create_schedule(
     morning_energy: int = Form(...),
     afternoon_energy: int = Form(...),
     evening_energy: int = Form(...),
+    protected_blocks: str = Form(""),
     tasks: str = Form(...),
 ):
     try:
+        protected = _protected_blocks(day, protected_blocks)
         profile = _profile(day, available_start, available_end,
-                           morning_energy, afternoon_energy, evening_energy)
+                           morning_energy, afternoon_energy, evening_energy,
+                           protected_blocks=protected)
         parsed_tasks = _tasks(day, tasks, available_start)
         run_id, _ = _run_schedule({
             "profile": profile.model_dump(mode="json"),
@@ -333,9 +573,19 @@ def index():
         f"<div class='card'><p class='q'>{html.escape(q.question)}</p><a href='/q/{q.id}'>Sort this out &rarr;</a></div>" for q in open_qs)
     return _page("NANI needs a decision", f"<h1>{len(open_qs)} thing(s) NANI can't decide alone</h1>" + items)
 
-
-@app.get("/q/{qid}", response_class=HTMLResponse)
-def show(qid: str):
+    parsed = [
+        {
+            "id": task["id"],
+            "title": task["title"],
+            "description": task.get("description"),
+            "deadline": task.get("deadline"),
+            "estimated_minutes": task["estimated_duration"],
+            "priority": task.get("priority", "medium"),
+            "status": "pending",
+        }
+        for task in payload.get("tasks", [])
+        if task.get("id") not in scheduled_ids
+    ]
     q = _store().get_question(qid)
     if q is None:
         return _page("Not found", "<h1>Not found</h1><p class='sub'>No such question.</p>")
@@ -359,8 +609,13 @@ def submit(qid: str, answer: str = Form(...), who: str = Form("user")):
     run_id = callback.answer(store, qid, text, who=who)
     if run_id:
         current_settings = load_settings()
-        call = None
-        if os.environ.get("NAGARE_AGENT_MODE", "offline").lower() == "model" and current_settings.api_key:
+        call = _focus_model_call(current_settings) if store.get_domain(
+            run_id) == "nagare_focus" else None
+        if store.get_domain(run_id) == "nagare_focus":
+            runner.advance(store, run_id, build_focus_flow(
+                call), current_settings)
+            return RedirectResponse(f"/focus/runs/{run_id}", status_code=303)
+        if os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model" and current_settings.api_key:
             from slice.llm import complete
             call = complete
         runner.advance(store, run_id, build_flow(call), current_settings)

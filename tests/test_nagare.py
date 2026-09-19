@@ -122,6 +122,46 @@ def test_reschedule_moves_task_into_a_future_feasible_slot():
     assert moved.id == "block_ml"
 
 
+def test_flow_reschedule_replaces_missed_block_instead_of_duplicating(tmp_path):
+    store = Store(tmp_path / "replace-missed.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(9, 17))
+    user_task = task("ml", duration=120)
+    old_block = block("block_ml", 9, 11, task_id="ml")
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [user_task.model_dump(mode="json")],
+            "existing_blocks": [old_block.model_dump(mode="json")],
+            "missed_task_id": "ml",
+        },
+        produced_by="test",
+    )
+    settings = Settings(
+        api_key="",
+        model="model",
+        fallback_model="fallback",
+        escalation_model="escalation",
+        max_tokens=100,
+        max_tokens_per_run=1000,
+        max_attempts_per_step=2,
+        expert_timeout_minutes=45,
+        langfuse_public="",
+        langfuse_secret="",
+        langfuse_host="",
+    )
+
+    assert runner.advance(
+        store, run_id, build_flow(), settings
+    ) is RunState.COMPLETE
+    blocks = store.latest(run_id, "decision")["schedule"]["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["task_id"] == "ml"
+    assert blocks[0]["start"] == "2026-09-19T09:00:00"
+
+
 def test_reschedule_preserves_locked_blocks():
     user_profile = profile(window(9, 17))
     locked = block("class", 13, 15, task_id=None,

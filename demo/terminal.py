@@ -32,6 +32,7 @@ from demo.nagare.schema import (
 )
 from demo.nagare.planner import baseline_schedule, reschedule_task
 from demo.nagare.flow import build_flow as build_nagare_flow
+from demo.nagare.focus import FocusTask, build_focus_flow
 from demo.nagare.demo_data import demo_tasks, demo_user_profile
 from slice.store import Store
 from slice.records import RunState
@@ -607,6 +608,75 @@ def replay_run(store: Store, run_id: str) -> None:
     print()
 
 
+def run_focus_agent(store: Store, st: Settings) -> None:
+    """Run the selected-task focus loop with terminal human checkpoints."""
+    print(f"\n{_c('Nagare Focus Agent', BOLD + CYAN)}")
+    print("Enter one pending task per line as: id | title | minutes | priority | deadline | description")
+    print("Press Enter on an empty line when finished.")
+    tasks = []
+    while True:
+        line = input("task> ").strip()
+        if not line:
+            break
+        parts = [part.strip() for part in line.split("|", 5)]
+        if len(parts) < 3:
+            print(_c("Use at least: id | title | minutes", AMBER))
+            continue
+        try:
+            tasks.append(FocusTask(
+                id=parts[0],
+                title=parts[1],
+                estimated_minutes=int(parts[2]),
+                priority=parts[3] if len(parts) > 3 and parts[3] else "medium",
+                deadline=parts[4] if len(parts) > 4 and parts[4] else None,
+                description=parts[5] if len(parts) > 5 and parts[5] else None,
+            ))
+        except ValueError as exc:
+            print(_c(f"Invalid task: {exc}", RED))
+    if not tasks:
+        print(_c("No tasks entered.", AMBER))
+        return
+
+    print("Available task IDs: " + ", ".join(task.id for task in tasks))
+    selected = input("Select one task ID> ").strip()
+    if selected not in {task.id for task in tasks}:
+        print(_c("That task ID was not entered.", RED))
+        return
+
+    store_run = store.create_run("nagare_focus")
+    store.append(
+        store_run,
+        "input",
+        {
+            "tasks": [task.model_dump(mode="json") for task in tasks],
+            "selected_task_id": selected,
+            "context": {},
+        },
+        produced_by="terminal_user",
+    )
+    call = None
+    if st.api_key:
+        from slice.llm import complete
+        call = complete
+    flow = build_focus_flow(call)
+    state = runner.advance(store, store_run, flow, st)
+    while state is RunState.AWAITING_EXPERT:
+        question = callback.pending(store, store_run)[0]
+        print(f"\n{_c('Nagare:', BOLD + CYAN)}\n{question.question}")
+        answer = input(f"{_c('Your answer> ', BOLD + GREEN)}").strip()
+        if not answer:
+            print(_c("A response is required to continue.", AMBER))
+            continue
+        callback.answer(store, question.id, answer, who="terminal_user")
+        state = runner.advance(store, store_run, flow, st)
+
+    print(f"\n{_c('Focus run:', BOLD)} {store_run} -> {state.value}")
+    for event in store.replay(store_run):
+        if event.kind in {"focus_recommendation", "focus_decision", "rejection_event", "breakdown_action", "breakdown_decision", "focus_outcome", "manual_control"}:
+            print(
+                f"  {_c(event.kind, CYAN)}: {json.dumps(event.payload, default=str)}")
+
+
 # ---------------------------------------------------------------------------
 # Main Interactive Loop
 # ---------------------------------------------------------------------------
@@ -634,6 +704,7 @@ def main_interactive_menu(db_path: str) -> None:
             f"  {_c('[7]', CYAN)} View User Circadian Profile & Energy Windows")
         print(f"  {_c('[8]', CYAN)} Run Smoke Test Agent (Spot & Gate)")
         print(f"  {_c('[9]', CYAN)} Replay Run History")
+        print(f"  {_c('[10]', CYAN)} Run Focus Agent (selected task)")
         print(f"  {_c('[0]', RED)}  Exit")
 
         try:
@@ -682,6 +753,9 @@ def main_interactive_menu(db_path: str) -> None:
             if rid:
                 replay_run(store, rid)
 
+        elif choice in ("10", "focus"):
+            run_focus_agent(store, st)
+
         elif choice in ("0", "exit", "quit", "q"):
             print(_c("Goodbye! Keep your day in flow.", CYAN))
             break
@@ -729,6 +803,8 @@ def main() -> int:
                         help="List all open human callback questions")
     parser.add_argument("--replay", metavar="RUN_ID",
                         help="Replay events for a specific run ID")
+    parser.add_argument("--focus", action="store_true",
+                        help="Run the selected-task focus agent")
 
     args = parser.parse_args()
     store = Store(args.db)
@@ -765,6 +841,11 @@ def main() -> int:
 
     if args.replay:
         replay_run(store, args.replay)
+        return 0
+
+    if args.focus:
+        print_banner(args.db, st)
+        run_focus_agent(store, st)
         return 0
 
     # Start full interactive REPL menu

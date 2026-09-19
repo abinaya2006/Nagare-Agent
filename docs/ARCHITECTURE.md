@@ -64,10 +64,10 @@ reconstructed into context each turn — never the other way round.
 | | |
 |---|---|
 | `slice/store.py:30` · `SCHEMA` | The tables. Note the two triggers at the bottom |
-| `slice/store.py:133` · `Store.append` | The only way to write. There is no update |
-| `slice/store.py:147` · `Store.latest` | The newest row of a kind — current state only when a kind has one instance per run |
-| `slice/store.py:156` · `Store.history` | Every version, oldest first — the diff a judge wants to see |
-| `slice/store.py:165` · `Store.replay` | The whole run in order |
+| `slice/store.py:136` · `Store.append` | The only way to write. There is no update |
+| `slice/store.py:151` · `Store.latest` | The newest row of a kind — current state only when a kind has one instance per run |
+| `slice/store.py:160` · `Store.history` | Every version, oldest first — the diff a judge wants to see |
+| `slice/store.py:169` · `Store.replay` | The whole run in order |
 
 **The design choice worth copying:** the versions table is append-only, and that
 is enforced by *SQLite triggers* rather than by convention. `UPDATE` or `DELETE`

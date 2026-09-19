@@ -98,12 +98,14 @@ class Store:
         self.db.execute(
             "INSERT INTO runs(id, domain, state, created_at, updated_at, meta_json)"
             " VALUES (?,?,?,?,?,?)",
-            (run_id, domain, RunState.DRAFTING.value, now, now, json.dumps(meta or {})),
+            (run_id, domain, RunState.DRAFTING.value,
+             now, now, json.dumps(meta or {})),
         )
         return run_id
 
     def get_state(self, run_id: str) -> RunState:
-        row = self.db.execute("SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
+        row = self.db.execute(
+            "SELECT state FROM runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"no such run: {run_id}")
         return RunState(row["state"])
@@ -115,7 +117,8 @@ class Store:
         )
 
     def meta(self, run_id: str) -> dict[str, Any]:
-        row = self.db.execute("SELECT meta_json FROM runs WHERE id=?", (run_id,)).fetchone()
+        row = self.db.execute(
+            "SELECT meta_json FROM runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(f"no such run: {run_id}")
         return json.loads(row["meta_json"])
@@ -137,7 +140,8 @@ class Store:
             " VALUES (?, (SELECT COALESCE(MAX(seq),0)+1 FROM versions WHERE run_id=?), ?,?,?,?)",
             (run_id, run_id, kind, produced_by, json.dumps(payload), time.time()),
         )
-        self.db.execute("UPDATE runs SET updated_at=? WHERE id=?", (time.time(), run_id))
+        self.db.execute("UPDATE runs SET updated_at=? WHERE id=?",
+                        (time.time(), run_id))
         row = self.db.execute(
             "SELECT MAX(seq) AS s FROM versions WHERE run_id=?", (run_id,)
         ).fetchone()
@@ -171,6 +175,23 @@ class Store:
         ).fetchall()
         return [_to_version(r) for r in rows]
 
+    def get_domain(self, run_id: str) -> str:
+        row = self.db.execute(
+            "SELECT domain FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"no such run: {run_id}")
+        return str(row["domain"])
+
+    def domain_history(self, domain: str) -> list[Version]:
+        """Return append-only history for a domain across all runs."""
+        rows = self.db.execute(
+            "SELECT v.seq, v.kind, v.produced_by, v.payload_json, v.created_at "
+            "FROM versions v JOIN runs r ON r.id=v.run_id "
+            "WHERE r.domain=? ORDER BY v.created_at, v.run_id, v.seq",
+            (domain,),
+        ).fetchall()
+        return [_to_version(r) for r in rows]
+
     # ------------------------------------------------------------ counters
 
     def bump(self, run_id: str, name: str, by: float = 1) -> float:
@@ -183,12 +204,14 @@ class Store:
 
     def counter(self, run_id: str, name: str) -> float:
         row = self.db.execute(
-            "SELECT value FROM counters WHERE run_id=? AND name=?", (run_id, name)
+            "SELECT value FROM counters WHERE run_id=? AND name=?", (
+                run_id, name)
         ).fetchone()
         return float(row["value"]) if row else 0.0
 
     def reset_counter(self, run_id: str, name: str) -> None:
-        self.db.execute("DELETE FROM counters WHERE run_id=? AND name=?", (run_id, name))
+        self.db.execute(
+            "DELETE FROM counters WHERE run_id=? AND name=?", (run_id, name))
 
     # ----------------------------------------------------------- questions
 
@@ -197,7 +220,8 @@ class Store:
         self.db.execute(
             "INSERT INTO questions(id, run_id, question, context_json, asked_at, timeout_at)"
             " VALUES (?,?,?,?,?,?)",
-            (qid, run_id, question, json.dumps(context), now, now + timeout_minutes * 60),
+            (qid, run_id, question, json.dumps(context),
+             now, now + timeout_minutes * 60),
         )
         return qid
 
@@ -208,7 +232,8 @@ class Store:
         )
 
     def get_question(self, question_id: str) -> Question | None:
-        row = self.db.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+        row = self.db.execute(
+            "SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
         return _to_question(row) if row else None
 
     def open_questions(self, run_id: str | None = None) -> list[Question]:
@@ -241,6 +266,7 @@ def _to_question(r: sqlite3.Row) -> Question:
         context=json.loads(r["context_json"]),
         asked_at=float(r["asked_at"]),
         timeout_at=float(r["timeout_at"]),
-        answered_at=float(r["answered_at"]) if r["answered_at"] is not None else None,
+        answered_at=float(
+            r["answered_at"]) if r["answered_at"] is not None else None,
         answer=r["answer"],
     )
