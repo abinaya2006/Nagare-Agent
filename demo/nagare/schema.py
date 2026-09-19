@@ -116,11 +116,12 @@ class Task(BaseModel):
     latest_finish: datetime | None = None
 
     deadline: datetime | None = None
-    deadline_type: Literal["hard", "soft"] | None = None
+    deadline_type: Literal["none", "hard", "soft"] = "none"
 
     # Scheduling flexibility
     fixed: bool = False
     movable: bool = True
+    protected: bool = False
 
     fragmentable: bool = False
     min_fragment_duration: int | None = None
@@ -184,13 +185,11 @@ class Task(BaseModel):
             )
 
         # A hard/soft deadline should be explicitly typed.
-        if self.deadline is not None and self.deadline_type is None:
-            raise ValueError(
-                "deadline_type is required when deadline is provided"
-            )
+        if self.deadline is not None and self.deadline_type == "none":
+            raise ValueError("deadline_type must be hard or soft when deadline is provided")
 
-        # A deadline type without a deadline has no meaning.
-        if self.deadline is None and self.deadline_type is not None:
+        # A typed deadline without a deadline has no meaning.
+        if self.deadline is None and self.deadline_type != "none":
             raise ValueError(
                 "deadline_type requires a deadline"
             )
