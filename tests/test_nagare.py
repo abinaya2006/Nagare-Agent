@@ -289,6 +289,51 @@ def test_injected_agent_draft_runs_through_validator_gate(tmp_path):
     assert store.history(run_id, "proposed_schedule")[
         0].produced_by == "agent:nagare_draft"
 
+
+def test_incomplete_ai_schedule_uses_feasible_deadline_fallback(tmp_path):
+    store = Store(tmp_path / "ai-incomplete.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(9, 12))
+    user_task = task(
+        duration=60,
+        deadline=DAY.replace(hour=11),
+        deadline_type="hard",
+    )
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [user_task.model_dump(mode="json")],
+            "existing_blocks": [],
+        },
+        produced_by="test",
+    )
+
+    def incomplete_agent(**kwargs):
+        return ProposedSchedule()
+
+    final_state = runner.advance(
+        store, run_id, build_flow(incomplete_agent), Settings(
+            api_key="test",
+            model="model",
+            fallback_model="fallback",
+            escalation_model="escalation",
+            max_tokens=100,
+            max_tokens_per_run=1000,
+            max_attempts_per_step=2,
+            expert_timeout_minutes=45,
+            langfuse_public="",
+            langfuse_secret="",
+            langfuse_host="",
+        ))
+
+    assert final_state is RunState.COMPLETE
+    assert store.latest(run_id, "decision")[
+        "schedule"]["blocks"][0]["task_id"] == "ml"
+    assert store.latest(run_id, "agent_fallback")[
+        "kind"] == "incomplete_proposal"
+
     def test_empty_agent_proposal_uses_feasible_fallback(tmp_path):
         store = Store(tmp_path / "agent-fallback.db")
         run_id = store.create_run("nagare")
@@ -411,3 +456,61 @@ def test_agent_loop_asks_and_resolves_fragmentation(tmp_path):
     assert runner.advance(store, run_id, build_flow(),
                           settings) is RunState.COMPLETE
     assert len(store.latest(run_id, "decision")["schedule"]["blocks"]) == 2
+
+
+def test_split_button_bypasses_ai_and_updates_schedule(tmp_path):
+    store = Store(tmp_path / "ai-fragment-loop.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(11, 14))
+    user_profile.protected_blocks = [window(12, 13)]
+    urgent = task(
+        duration=120,
+        deadline=DAY.replace(hour=14),
+        deadline_type="hard",
+        fragmentable=True,
+        min_fragment_duration=60,
+        preferred_fragment_duration=60,
+    )
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [urgent.model_dump(mode="json")],
+            "existing_blocks": [],
+        },
+        produced_by="test",
+    )
+
+    calls = []
+
+    def fake_agent(**kwargs):
+        calls.append(kwargs)
+        return ProposedSchedule()
+
+    ai_settings = Settings(
+        api_key="test",
+        model="model",
+        fallback_model="fallback",
+        escalation_model="escalation",
+        max_tokens=100,
+        max_tokens_per_run=1000,
+        max_attempts_per_step=2,
+        expert_timeout_minutes=45,
+        langfuse_public="",
+        langfuse_secret="",
+        langfuse_host="",
+    )
+
+    assert runner.advance(
+        store, run_id, build_flow(fake_agent), ai_settings
+    ) is RunState.AWAITING_EXPERT
+    question = callback.pending(store, run_id)[0]
+    calls_before_split = len(calls)
+    callback.answer(store, question.id, "fragment the task", who="user")
+
+    state = runner.advance(store, run_id, build_flow(fake_agent), ai_settings)
+
+    assert state is RunState.COMPLETE
+    assert len(store.latest(run_id, "decision")["schedule"]["blocks"]) == 2
+    assert len(calls) == calls_before_split

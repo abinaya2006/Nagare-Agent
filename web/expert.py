@@ -247,6 +247,15 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
             block.get("task_id") for block in schedule.get("blocks", [])
             if block.get("block_type") == "task" and block.get("task_id")
         }
+        completed_ids = {
+            (focus_input.get("selected_task_id"), focus_input.get(
+                "context", {}).get("source_schedule_run_id"))
+            for focus_run in store.list_runs(limit=100)
+            if focus_run["domain"] == "nagare_focus"
+            for focus_input in [store.latest(focus_run["id"], "input") or {}]
+            if focus_input.get("context", {}).get("source_schedule_run_id") == run["id"]
+            and (store.latest(focus_run["id"], "focus_outcome") or {}).get("status") == "completed"
+        }
         pending = [
             {
                 "id": task["id"],
@@ -259,6 +268,7 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
             }
             for task in payload.get("tasks", [])
             if task.get("id") not in scheduled_ids
+            and (task.get("id"), run["id"]) not in completed_ids
         ]
         return run["id"], pending
     return None, []
@@ -390,10 +400,42 @@ def _schedule_html(run_id: str) -> str:
     decision = ""
     if pending:
         question = pending[0]
+        conflict_items = question.context.get("conflicts", [])
+        conflict_html = ""
+        if conflict_items:
+            conflict_html = "<div class='conflict-list'>" + "".join(
+                "<div class='conflict-item'>"
+                f"<strong>{html.escape(tasks.get(item.get('task_id'), {}).get('title', 'Unscheduled task'))}</strong>"
+                f"<span>{html.escape(item.get('explanation', 'No safe slot was found.'))}</span>"
+                "</div>"
+                for item in conflict_items
+            ) + "</div>"
+        has_fragmentation = any(
+            item.get("conflict_type") == "fragmentation"
+            for item in conflict_items
+        )
+        if has_fragmentation:
+            decision_controls = (
+                f"<form method='post' action='/q/{html.escape(question.id)}' class='decision-actions'>"
+                "<input type='hidden' name='who' value='user'>"
+                "<button type='submit' name='answer' value='fragment the task'>Split this task</button>"
+                "<button type='submit' name='answer' value='move the task to tomorrow' class='button-secondary'>Move task to tomorrow</button>"
+                f"<a class='button-link' href='/q/{html.escape(question.id)}'>Other answer</a></form>"
+            )
+        elif conflict_items:
+            decision_controls = (
+                f"<form method='post' action='/q/{html.escape(question.id)}' class='decision-actions'>"
+                "<input type='hidden' name='who' value='user'>"
+                "<button type='submit' name='answer' value='move the task to tomorrow'>Move task to tomorrow</button>"
+                "<button type='submit' name='answer' value='leave it missed' class='button-secondary'>Keep pending</button>"
+                f"<a class='button-link' href='/q/{html.escape(question.id)}'>Other answer</a></form>"
+            )
+        else:
+            decision_controls = f"<a class='button-link' href='/q/{html.escape(question.id)}'>Write an answer</a>"
         decision = (
-            "<div class='card'><h2>Your decision is needed</h2>"
+            "<div class='card decision-card'><p class='kicker'>Human checkpoint</p><h2>Your decision is needed</h2>"
             f"<p class='sub'>{html.escape(question.question)}</p>"
-            f"<a class='nav-link' href='/q/{html.escape(question.id)}'>Answer this decision</a></div>"
+            f"{conflict_html}{decision_controls}</div>"
         )
     failure_notice = ""
     if failure:
@@ -446,6 +488,10 @@ background:var(--teal);color:#fff;font-family:Georgia,serif;font-size:1.35rem}}
 .button-secondary:hover{{background:#b6533d}}
 .button-quiet{{background:transparent;color:var(--teal);border:1px solid #9cb5ad;box-shadow:none}}
 .button-quiet:hover{{background:#e1ece7}}
+.button-link{{display:inline-flex;align-items:center;min-height:2.65rem;padding:.65rem 1rem;border:1px solid #9cb5ad;border-radius:8px;color:var(--teal);font-weight:700;text-decoration:none}}
+.conflict-list{{display:grid;gap:.65rem;margin:1rem 0}}
+.conflict-item{{display:grid;gap:.1rem;padding:.75rem .85rem;background:#fff;border-left:3px solid var(--coral);font-size:.9rem}}
+.conflict-item span{{color:var(--muted)}}
 h1{{font-family:Georgia,"Times New Roman",serif;font-size:clamp(2rem,5vw,3.4rem);line-height:1.05;
 letter-spacing:-.02em;margin:0 0 .7rem;color:var(--ink)}}
 h2{{font-size:1.05rem;margin:0 0 .75rem;color:var(--ink)}}
@@ -598,6 +644,40 @@ def index():
                  "<textarea name='answer' autofocus placeholder='What should NANI do&hellip;'></textarea>"
                  "<input type='hidden' name='who' value='user'>"
                  "<button type='submit'>Send</button></form>")
+
+
+@app.get("/q/{qid}", response_class=HTMLResponse)
+def show_question(qid: str):
+    question = _store().get_question(qid)
+    if question is None:
+        return _page("Not found", "<h1>Not found</h1><p class='sub'>No such question.</p>")
+    if question.is_answered:
+        return _page(
+            "Already answered",
+            "<h1>Already answered</h1>"
+            f"<div class='ctx'><b>Your answer</b>{html.escape(question.answer or '')}</div>"
+            "<p><a href='/'>Back</a></p>",
+        )
+    context_html = ""
+    conflicts = question.context.get("conflicts", [])
+    if conflicts:
+        context_html = "<div class='conflict-list'>" + "".join(
+            "<div class='conflict-item'>"
+            f"<strong>{html.escape(str(item.get('conflict_type', 'conflict')).replace('_', ' ').title())}</strong>"
+            f"<span>{html.escape(item.get('explanation', 'No safe slot was found.'))}</span></div>"
+            for item in conflicts
+        ) + "</div>"
+    return _page(
+        "Human decision",
+        "<h1>A decision is needed</h1>"
+        f"<p class='q'>{html.escape(question.question)}</p>"
+        f"{context_html}"
+        f"<form method='post' action='/q/{html.escape(qid)}'>"
+        "<textarea name='answer' autofocus placeholder='Tell Nagare what to do...'></textarea>"
+        "<input type='hidden' name='who' value='user'>"
+        "<button type='submit'>Send decision</button></form>"
+        "<p class='note'>Your answer is recorded and used to resume this run.</p>",
+    )
 
 
 @app.post("/q/{qid}")

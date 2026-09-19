@@ -138,26 +138,26 @@ def build_flow(call=None):
         missed_task_id = payload.get(
             "missed_task_id") or payload.get("block_id")
 
-        # Keep the offline path useful for terminal demos and tests. In AI mode
-        # the same answer is forwarded to the model below for interpretation.
-        if answer_text and not call:
-            if "fragment" in answer_text or "split" in answer_text:
-                conflict_ids = {
-                    item.get("task_id")
-                    for item in (ctx.latest("validation") or {}).get("conflicts", [])
-                    if item.get("conflict_type") == "fragmentation"
-                }
-                task_to_fragment = next(
-                    (item for item in tasks if item.id in conflict_ids), None)
-                if task_to_fragment is not None:
-                    ctx.append(
-                        "proposed_schedule",
-                        fragment_task(task_to_fragment, profile,
-                                      existing).model_dump(mode="json"),
-                        produced_by="planner:offline_fragmentation",
-                    )
-                    return RunState.GATING
+        # Explicit human actions are authoritative in both AI and offline mode.
+        # Do not ask the model to reinterpret a button the user already chose.
+        if answer_text and ("fragment" in answer_text or "split" in answer_text):
+            conflict_ids = {
+                item.get("task_id")
+                for item in (ctx.latest("validation") or {}).get("conflicts", [])
+                if item.get("conflict_type") == "fragmentation"
+            }
+            task_to_fragment = next(
+                (item for item in tasks if item.id in conflict_ids), None)
+            if task_to_fragment is not None:
+                ctx.append(
+                    "proposed_schedule",
+                    fragment_task(task_to_fragment, profile,
+                                  existing).model_dump(mode="json"),
+                    produced_by="planner:human_fragmentation",
+                )
+                return RunState.GATING
 
+        if answer_text and not call:
             if "shorten" in answer_text:
                 import re
                 duration_match = re.search(
@@ -244,8 +244,40 @@ def build_flow(call=None):
         else:
             schedule = offline_schedule()
 
-        # NOTE: We removed the 'feasible fallback override'. The AI's schedule is now trusted
-        # and sent to the Validator. The Validator will catch omissions!
+        if used_agent:
+            fallback_validation = validate_schedule(
+                offline_schedule(),
+                tasks,
+                profile,
+                [block for block in existing if block.locked],
+            )
+            proposed_task_ids = {
+                block.task_id
+                for block in schedule.blocks
+                if block.block_type == "task" and block.task_id is not None
+            }
+            fallback_task_ids = {
+                block.task_id
+                for block in offline_schedule().blocks
+                if block.block_type == "task" and block.task_id is not None
+            }
+            if (
+                fallback_validation.status == "PASS"
+                and fallback_task_ids - proposed_task_ids
+            ):
+                ctx.append(
+                    "agent_fallback",
+                    {
+                        "kind": "incomplete_proposal",
+                        "detail": (
+                            "The AI omitted tasks that fit the supplied deadline "
+                            "and availability; used the validated fallback schedule."
+                        ),
+                    },
+                    produced_by="system",
+                )
+                schedule = offline_schedule()
+                used_agent = False
 
         ctx.append(
             "proposed_schedule",

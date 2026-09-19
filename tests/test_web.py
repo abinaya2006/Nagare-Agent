@@ -132,6 +132,10 @@ def test_focus_web_flow_accepts_selected_task_and_records_outcome(tmp_path):
     )
     assert completed.status_code == 200
     assert store.latest(run["id"], "focus_outcome")["status"] == "completed"
+    queue_after_completion = client.get("/focus")
+    assert queue_after_completion.status_code == 200
+    assert "Your pending queue is clear" in queue_after_completion.text
+    assert "Finish ML assignment" not in queue_after_completion.text
 
 
 def test_schedule_conflict_resumes_after_deferring_task(tmp_path):
@@ -152,11 +156,16 @@ def test_schedule_conflict_resumes_after_deferring_task(tmp_path):
     )
 
     assert "awaiting_expert" in response.text
-    assert "Answer this decision" in response.text
+    assert "Move task to tomorrow" in response.text
+    assert "Study networks" in response.text
+    assert "usable minutes" in response.text
 
     store = Store(expert.DB)
     run = store.list_runs(limit=1)[0]
     question = store.open_questions(run["id"])[0]
+    question_page = client.get(f"/q/{question.id}")
+    assert question_page.status_code == 200
+    assert "A decision is needed" in question_page.text
     answer = client.post(
         f"/q/{question.id}",
         data={"answer": "move the task to tomorrow", "who": "user"},
