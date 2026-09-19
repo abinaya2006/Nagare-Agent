@@ -1,8 +1,15 @@
 # AgentSpec — Nagare Auto-Reschedule Agent
 
-**Team:** Dot
-**Department:** Information Technology
-**Submitted:** 15 September 2026
+**Team:** Dot  
+**Department:** Information Technology  
+**Submitted:** 15 September 2026  
+
+**Team Members:**  
+Abinaya S  
+Vinu Priya V  
+Harshatha Rithika S  
+Manaswini K S  
+Ezhil Oviya S  
 
 ---
 
@@ -61,7 +68,7 @@ it retries before asking is decided by the run, not fixed in advance.
 
 student's day, before the miss:
 
-```
+```text
 09:00–11:00  DBMS lecture           fixed
 11:00–13:00  Thesis reading          movable   ← missed
 13:00–14:00  Lunch                   protected
@@ -81,37 +88,53 @@ student's day, before the miss:
   "original_slot": "11:00-13:00", "reason": "make-up lab ran till 13:30" }
 ```
 
-**Step 1 — draft.** The agent scans for a 120-minute gap after 13:30. None is
-free outright, so it proposes bumping the largest movable block with no
-same-day deadline.
+**Step 1: Draft.** The agent scans the remaining schedule for ways to fit
+the missed 120-minute thesis-reading block. No 120-minute slot is free
+outright, so it considers movable blocks that could be displaced without
+immediately violating a protected moment or hard deadline.
+
+It proposes moving Kibo debugging from 14:00–16:00 because Kibo has no
+same-day deadline and moving it creates a 120-minute candidate slot before
+the gym buffer.
 
 ```json
 { "kind": "reschedule_attempt", "attempt": 1,
   "block_id": "thesis-read-01", "new_slot": "14:00-16:00",
   "bumped": ["kibo-debug-01"],
-  "reasoning": "Only 120-minute movable block before the gym buffer; Kibo debugging has no deadline today" }
+  "reasoning": "Kibo debugging is movable, has no same-day deadline, and moving it creates a 120-minute candidate slot before the protected gym buffer" }
 ```
 
-**Step 2 — check.** The bump only works if Kibo debugging can itself land
-somewhere today. It can't, without hitting IRIS demo prep's deadline.
+**Step 2: Check.** The proposed placement is only valid if Kibo debugging
+can itself be placed somewhere else today. The deterministic checker tests
+the candidate against the remaining schedule and finds that its only
+available 120-minute placement would be 19:00–21:00, which conflicts with
+IRIS demo prep's hard deadline.
 
 ```json
 { "kind": "conflict_check", "attempt": 1, "passed": false,
   "conflicts": [
     { "with": "kibo-debug-01",
-      "why": "the only opening left for it is 19:00-21:00, which runs into IRIS demo prep's 21:00 hard deadline" } ] }
+      "why": "the only opening left for it is 19:00-21:00, which conflicts with IRIS demo prep's 21:00 hard deadline" } ] }
 ```
 
-**Step 3 — draft again.** The agent tries bumping IRIS demo prep instead.
+The failed check becomes part of the agent's state. The next planning attempt
+must account for the fact that moving Kibo creates this conflict.
+
+**Step 3: Draft again.** Using the failed candidate as a new constraint,
+the agent considers another displacement rather than simply repeating the
+same rule. It considers moving IRIS demo prep instead, because the 19:00–21:00
+slot is the other possible 120-minute placement for the missed thesis block.
 
 ```json
 { "kind": "reschedule_attempt", "attempt": 2,
   "block_id": "thesis-read-01", "new_slot": "19:00-21:00",
   "bumped": ["iris-demo-prep-01"],
-  "reasoning": "Only other 120-minute movable slot; iris-demo-prep-01 would need to move" }
+  "reasoning": "The previous candidate failed because Kibo could not be placed without creating a deadline conflict; the remaining viable 120-minute candidate requires considering IRIS demo prep instead" }
 ```
 
-**Step 4 — check again.** Rejected for the same underlying reason.
+**Step 4: Check again.** The deterministic checker rejects the second
+candidate because IRIS demo prep has a hard deadline at 21:00 and there is no
+earlier two-hour opening for it.
 
 ```json
 { "kind": "conflict_check", "attempt": 2, "passed": false,
@@ -120,8 +143,14 @@ somewhere today. It can't, without hitting IRIS demo prep's deadline.
       "why": "has a hard deadline at 21:00 today and cannot move later; there is no earlier opening for it either" } ] }
 ```
 
-**Step 5 — stop and ask.** Both failures trace back to the same fact: every
-movable block today is already load-bearing. The agent stops rewriting.
+At this point, the agent has tried the available displacement candidates and
+the accumulated conflict history shows that every remaining option requires
+a preference the agent does not have.
+
+**Step 5: Stop and ask.** Both failures trace back to the same underlying
+fact: every movable block today is already load-bearing. The agent stops
+rewriting rather than inventing a preference or silently violating a hard
+constraint.
 
 ```json
 { "kind": "question", "asked_of": "user", "state": "waiting",
@@ -134,6 +163,11 @@ movable block today is already load-bearing. The agent stops rewriting.
 The run stops here in **waiting for user**. Nothing is written back to today's
 schedule for that block — it stays flagged *missed — unresolved*, not silently
 placed.
+
+The important part of the loop is that the failed attempts are not discarded:
+each conflict becomes information used by the next planning attempt. The agent
+can therefore choose a different candidate, revise its plan, or stop when the
+remaining decision requires human preference.
 
 ## 5. Who is doing the thinking
 
@@ -193,11 +227,10 @@ call doesn't quietly eat a revision.
 class ScheduleBlock(BaseModel):
     id: str
     title: str
-    slot: str  # "HH:MM-HH:MM"
+    slot: str          # "HH:MM-HH:MM"
     movable: bool
     protected: bool
     deadline: str | None = None
-
 
 class RescheduleAttempt(BaseModel):
     attempt: int
@@ -206,11 +239,9 @@ class RescheduleAttempt(BaseModel):
     bumped: list[str] = Field(max_length=3)
     reasoning: str
 
-
 class Conflict(BaseModel):
     with_block: str
     why: str
-
 
 class ConflictCheck(BaseModel):
     attempt: int
@@ -385,7 +416,6 @@ other would need a lock or a combined search.
 | `google-genai` (post-migration) returns valid JSON for the check prompt reliably | run the check prompt twenty times against the walkthrough day, count schema failures | no |
 | NANI's Gemini free-tier quota covers a full day of draft/check testing | read the quota page, then run enough pairs to hit phase-2 volume | no |
 | Two `conflict_check` records can be compared for "same underlying cause" without a model call | write the comparison, try it on the walkthrough's two attempts | no |
-| The reschedule service's `AI_SERVICE_URL` points at NANI's port 8001, not 8000 | check the service's env config before wiring real calls in phase 2 | no |
 
 ---
 
