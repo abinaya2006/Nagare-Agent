@@ -28,10 +28,21 @@ class TimeWindow(BaseModel):
             raise ValueError("end must be after start")
         return self
 
+# ---------------------------------------------------------------------------
+# Rescheduling Request
+# ---------------------------------------------------------------------------
+
+
+class RescheduleRequest(BaseModel):
+    """Request to repair an existing schedule after a block is missed."""
+    block_id: str
+    occurred_at: datetime
+    reason: str | None = None
 
 # ---------------------------------------------------------------------------
 # User scheduling preferences
 # ---------------------------------------------------------------------------
+
 
 class CircadianProfile(BaseModel):
     """User's typical energy levels throughout the day.
@@ -186,7 +197,8 @@ class Task(BaseModel):
 
         # A hard/soft deadline should be explicitly typed.
         if self.deadline is not None and self.deadline_type == "none":
-            raise ValueError("deadline_type must be hard or soft when deadline is provided")
+            raise ValueError(
+                "deadline_type must be hard or soft when deadline is provided")
 
         # A typed deadline without a deadline has no meaning.
         if self.deadline is None and self.deadline_type != "none":
