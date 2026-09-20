@@ -1,43 +1,17 @@
-# Nagare Agentic Workflow
+# Design Rationale
 
-Nagare uses a bounded agentic loop for schedule planning. The model is allowed
-to propose a typed schedule, but it does not control state transitions or the
-final decision.
+## What it does
 
-## Control Loop
+Nagare creates a daily schedule from tasks, available time, deadlines, and protected moments. When it cannot safely decide, it asks the user and records the answer before continuing.
 
-1. `DRAFTING` assembles the user's tasks, energy profile, availability,
-	existing blocks, previous proposal, validation conflicts, and human answer.
-2. The planner agent returns a `ProposedSchedule` through the shared typed LLM
-	boundary.
-3. `GATING` runs the independent deterministic validator.
-4. A passing schedule becomes a recorded decision and the run completes.
-5. A blocked schedule returns to `DRAFTING` for a bounded number of revisions.
-6. Repeated or unresolved conflicts create a durable callback question and move
-	the run to `AWAITING_EXPERT`.
-7. The user's answer is appended to the event log, the runner resumes, and an
-	explicit deferral such as "move the task to tomorrow" becomes a recorded
-	scheduling decision.
+## Why this shape
 
-## Boundaries
+We chose not to let the model control validation, state changes, or protected-time rules because those decisions must be predictable and auditable. We also did not build a fully automatic rescheduler because some conflicts require the user's judgement.
 
-- The model proposes; it cannot bypass validation.
-- The validator checks overlap, availability, protected time, deadlines, sleep,
-  locked blocks, and tasks omitted from the proposal.
-- The runner owns sequencing, retry limits, persistence, and suspension.
-- The callback layer owns human decisions and resume behavior.
+## What it can't do
 
-## Execution Modes
+Nagare cannot solve a conflict when there is not enough valid time, when the user's answer does not resolve the conflict, or when a task requires information the system does not have. It also cannot safely invent a new time outside the user's available windows.
 
-Offline mode is the default for tests and local demos. It uses the existing
-deterministic planner without a network call. To enable the model planner in
-the browser app, configure an API key and set:
+## What we'd do next
 
-```bash
-export NAGARE_AGENT_MODE=model
-uvicorn web.expert:app --host 0.0.0.0 --port 8000
-```
-
-The terminal interface automatically uses the model planner when an API key is
-available. In both modes, validation and human escalation remain deterministic
-and auditable.
+We would improve the interface for explaining conflicts and add more scheduling choices without weakening the deterministic checks. We would also test the system with more real schedules and edge cases before adding more automation.
