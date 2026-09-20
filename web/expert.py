@@ -88,7 +88,7 @@ def _datetime(day: str, value: str) -> datetime:
 
 def _profile(day: str, available_start: str, available_end: str,
              morning_energy: int, afternoon_energy: int,
-             evening_energy: int,
+             evening_energy: int, task_break_minutes: int = 15,
              protected_blocks: list[TimeWindow] | None = None) -> UserScheduleProfile:
 
     start_today = _datetime(day, available_start)
@@ -113,6 +113,7 @@ def _profile(day: str, available_start: str, available_end: str,
         protected_blocks=protected_blocks or [],
         preferred_session_length=60,
         preferred_break_length=15,
+        task_break_minutes=task_break_minutes,
         sleep_window=TimeWindow(
             start=_datetime(day, "23:00"),
             end=_datetime(day, "23:00") + timedelta(hours=8),
@@ -146,8 +147,13 @@ def _tasks(day: str, raw_tasks: str, available_start: str) -> list[Task]:
                 "Each task must use: title | minutes | priority | deadline")
         duration = int(parts[1])
         priority = int(parts[2]) if len(parts) > 2 and parts[2] else 3
-        deadline = _datetime(day, parts[3]) if len(
-            parts) > 3 and parts[3] else None
+        deadline_text = parts[3].lower() if len(parts) > 3 else ""
+        no_deadline = {"", "none", "no deadline", "n/a", "na", "-"}
+        deadline = (
+            None
+            if deadline_text in no_deadline
+            else _datetime(day, deadline_text)
+        )
 
         parsed.append(Task(
             id=f"task-{index:03d}",
@@ -163,6 +169,29 @@ def _tasks(day: str, raw_tasks: str, available_start: str) -> list[Task]:
     if not parsed:
         raise ValueError("Add at least one task.")
     return parsed
+
+
+def _task_rows(day: str, titles: list[str], minutes: list[int],
+               priorities: list[int], deadlines: list[str],
+               available_start: str) -> list[Task]:
+    rows = []
+    for index, title in enumerate(titles):
+        if not title.strip():
+            continue
+        rows.append(_tasks(
+            day,
+            " | ".join([
+                title.strip(),
+                str(minutes[index]),
+                str(priorities[index]),
+                deadlines[index] if index < len(deadlines) else "none",
+            ]),
+            available_start,
+        )[0])
+    if not rows:
+        raise ValueError("Choose or add at least one task.")
+    return [task.model_copy(update={"id": f"task-{index:03d}"})
+            for index, task in enumerate(rows, 1)]
 
 
 def _run_schedule(payload: dict) -> tuple[str, RunState]:
@@ -491,6 +520,11 @@ def _schedule_html(run_id: str) -> str:
         f"{decision}"
         "<div class='card'><table><thead><tr><th>Time</th><th>Task</th><th>Status</th></tr></thead>"
         f"<tbody>{rows}</tbody></table></div>"
+        "<div class='card'><h2>Add tasks</h2>"
+        "<p class='hint'>New tasks will be scheduled around the blocks already shown.</p>"
+        f"<form method='post' action='/runs/{html.escape(run_id)}/add-tasks'>"
+        "<textarea name='tasks' required placeholder='Task title | minutes | priority | deadline\nReview notes | 30 | 2 | none'></textarea>"
+        "<button type='submit'>Add and reschedule</button></form></div>"
         "<div class='card'><h2>Something changed?</h2>"
         f"<form method='post' action='/runs/{html.escape(run_id)}/reschedule'>"
         f"<label>Missed task<select name='task_id'>{options}</select></label>"
@@ -583,14 +617,38 @@ def schedule_form():
         f"<label>Date<input type='date' name='day' value='{datetime.now(timezone.utc).date().isoformat()}' required></label>"
         "<label>Available from<input type='time' name='available_start' value='09:00' required></label>"
         "<label>Available until<input type='time' name='available_end' value='21:00' required></label>"
+        "<label>Break between tasks <output id='break-value'>15</output> min"
+        "<input type='range' name='task_break_minutes' min='0' max='60' step='5' value='15' "
+        "oninput=\"document.getElementById('break-value').value=this.value\"></label>"
         "<label>Morning energy (0-5)<input type='number' name='morning_energy' min='0' max='5' value='5' required></label>"
         "<label>Afternoon energy (0-5)<input type='number' name='afternoon_energy' min='0' max='5' value='3' required></label>"
         "<label>Evening energy (0-5)<input type='number' name='evening_energy' min='0' max='5' value='2' required></label>"
-        "<label>Protected moments<textarea name='protected_blocks' placeholder='Lunch | 13:00 | 14:00\nGym | 18:00 | 19:00'></textarea></label>"
-        "<p class='hint'>Optional. One protected moment per line: name | start | end.</p>"
-        "<label>Tasks<textarea name='tasks' required placeholder='Task title | minutes | priority | deadline\nStudy networks | 90 | 3 | 18:00\nReply to email | 30 | 2'></textarea></label>"
-        "<p class='hint'>One task per line. Deadline is optional and uses HH:MM. Priority is 1 (low) to 5 (high).</p>"
+        "<fieldset><legend>Protected moments</legend>"
+        "<div id='protected-rows'><div class='entry-row protected-row'>"
+        "<select name='protected_name'><option value=''>No protected moment</option>"
+        "<option>Lunch</option><option>Breakfast</option><option>Gym</option>"
+        "<option>Class</option><option>Commute</option><option>Custom</option></select>"
+        "<input type='time' name='protected_start'><input type='time' name='protected_end'>"
+        "</div></div><button type='button' class='button-quiet' onclick='addProtectedRow()'>+ Add protected moment</button></fieldset>"
+        "<details><summary>Testing / paste protected moments</summary>"
+        "<p class='hint'>One per line: name | start | end.</p>"
+        "<textarea name='protected_blocks' placeholder='Lunch | 13:00 | 14:00\nGym | 18:00 | 19:00'></textarea></details>"
+        "<fieldset><legend>Tasks</legend><div id='task-rows'>"
+        "<div class='entry-row task-row'><input name='task_title' placeholder='Task name'>"
+        "<select name='task_minutes'><option value='30'>30 min</option><option value='60' selected>60 min</option><option value='90'>90 min</option><option value='120'>120 min</option><option value='150'>150 min</option></select>"
+        "<select name='task_priority'><option value='1'>Low</option><option value='2'>2</option><option value='3' selected>Medium</option><option value='4'>4</option><option value='5'>High</option></select>"
+        "<label class='deadline-choice'><input type='checkbox' checked onchange='toggleDeadline(this)'> No deadline</label>"
+        "<input type='time' name='task_deadline'></div></div>"
+        "<button type='button' class='button-quiet' onclick='addTaskRow()'>+ Add task</button></fieldset>"
+        "<details><summary>Testing / legacy task format</summary>"
+        "<p class='hint'>One task per line: title | minutes | priority | deadline. Use none when there is no deadline.</p>"
+        "<textarea name='tasks' placeholder='Study networks | 90 | 3 | 18:00\nReply to email | 30 | 2 | none'></textarea></details>"
         "<button type='submit'>Generate schedule</button></form>"
+        "<script>"
+        "function toggleDeadline(box){const field=box.closest('.task-row').querySelector('[name=task_deadline]'); field.value=box.checked?'':field.value;}"
+        "function addTaskRow(){const row=document.querySelector('.task-row').cloneNode(true); row.querySelector('[name=task_title]').value=''; row.querySelector('[name=task_title]').required=true; row.querySelector('[type=checkbox]').checked=true; row.querySelector('[name=task_deadline]').value=''; document.getElementById('task-rows').appendChild(row);}"
+        "function addProtectedRow(){const row=document.querySelector('.protected-row').cloneNode(true); row.querySelectorAll('input').forEach(input=>input.value=''); row.querySelector('select').value=''; document.getElementById('protected-rows').appendChild(row);}"
+        "</script>"
         "<p><a href='/'>Pending decisions</a></p>",
     )
 
@@ -603,15 +661,38 @@ def create_schedule(
     morning_energy: int = Form(...),
     afternoon_energy: int = Form(...),
     evening_energy: int = Form(...),
+    task_break_minutes: int = Form(15),
+    protected_name: list[str] = Form([]),
+    protected_start: list[str] = Form([]),
+    protected_end: list[str] = Form([]),
+    task_title: list[str] = Form([]),
+    task_minutes: list[int] = Form([]),
+    task_priority: list[int] = Form([]),
+    task_deadline: list[str] = Form([]),
     protected_blocks: str = Form(""),
-    tasks: str = Form(...),
+    tasks: str = Form(""),
 ):
     try:
+        protected_lines = [
+            f"{name or 'Protected'} | {start} | {end}"
+            for name, start, end in zip(
+                protected_name, protected_start, protected_end)
+            if name and start and end
+        ]
+        protected_blocks = "\n".join(protected_lines) or protected_blocks
         protected = _protected_blocks(day, protected_blocks)
         profile = _profile(day, available_start, available_end,
                            morning_energy, afternoon_energy, evening_energy,
+                           task_break_minutes=task_break_minutes,
                            protected_blocks=protected)
-        parsed_tasks = _tasks(day, tasks, available_start)
+        if any(title.strip() for title in task_title):
+            parsed_tasks = _task_rows(
+                day, task_title, task_minutes, task_priority,
+                task_deadline,
+                available_start,
+            )
+        else:
+            parsed_tasks = _tasks(day, tasks, available_start)
         run_id, _ = _run_schedule({
             "profile": profile.model_dump(mode="json"),
             "tasks": [task.model_dump(mode="json") for task in parsed_tasks],
@@ -620,6 +701,40 @@ def create_schedule(
         return _page("Schedule ready", _schedule_html(run_id))
     except (ValueError, TypeError) as exc:
         return _page("Schedule input error", f"<h1>Could not build that schedule</h1><p class='error'>{html.escape(str(exc))}</p><p><a href='/schedule'>Back to schedule form</a></p>")
+
+
+@app.post("/runs/{run_id}/add-tasks", response_class=HTMLResponse)
+def add_tasks(run_id: str, tasks: str = Form(...)):
+    store = _store()
+    try:
+        payload = store.latest(run_id, "input")
+        schedule = store.latest(run_id, "proposed_schedule")
+        if payload is None or schedule is None:
+            raise ValueError("That schedule run no longer exists.")
+        profile = UserScheduleProfile.model_validate(payload["profile"])
+        existing_tasks = list(payload.get("tasks", []))
+        day = profile.available_windows[0].start.date().isoformat()
+        available_start = profile.available_windows[0].start.strftime("%H:%M")
+        additions = _tasks(day, tasks, available_start)
+        next_index = len(existing_tasks) + 1
+        additions = [
+            item.model_copy(update={"id": f"task-{next_index + index:03d}"})
+            for index, item in enumerate(additions)
+        ]
+        next_payload = dict(payload)
+        next_payload["tasks"] = existing_tasks + [
+            item.model_dump(mode="json") for item in additions
+        ]
+        next_payload["existing_blocks"] = schedule.get("blocks", [])
+        next_payload["added_task_ids"] = [item.id for item in additions]
+        new_run_id, _ = _run_schedule(next_payload)
+        return _page("Tasks added", _schedule_html(new_run_id))
+    except (ValueError, TypeError) as exc:
+        return _page(
+            "Add tasks error",
+            f"<h1>Could not add those tasks</h1><p class='error'>{html.escape(str(exc))}</p>"
+            f"<p><a href='/runs/{html.escape(run_id)}'>Back to schedule</a></p>",
+        )
 
 
 @app.post("/runs/{run_id}/reschedule", response_class=HTMLResponse)

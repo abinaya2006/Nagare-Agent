@@ -10,6 +10,10 @@ def _overlaps(start, end, block):
     return start < block.end and end > block.start
 
 
+def _task_gap(profile):
+    return timedelta(minutes=max(0, profile.task_break_minutes))
+
+
 def _protected(start, end, profile):
     protected_windows = [
         *profile.protected_blocks,
@@ -53,7 +57,10 @@ def _fits(task, start, end, profile, blocks):
 
     # Never overlap another block
     for block in blocks:
-        if _overlaps(start, end, block):
+        occupied_end = block.end
+        if block.block_type == "task":
+            occupied_end += _task_gap(profile)
+        if start < occupied_end and end > block.start:
             return False
 
     return True
@@ -130,14 +137,14 @@ def baseline_schedule(tasks, profile, user_responses=None, existing=None):
 
     response_order = _response_task_order(tasks, user_responses)
 
-    # Fixed tasks first, then deadline, priority, and user direction.
+    # Fixed tasks first, then priority, deadline, and user direction.
     ordered_tasks = sorted(
         tasks,
         key=lambda task: (
             not task.fixed,
+            -task.priority,
             task.deadline is None,
             task.deadline.isoformat() if task.deadline else "9999-12-31T23:59:59",
-            -task.priority,
             response_order.get(task.id, len(response_order)),
             -task.consequence_of_delay,
             task.id,
@@ -145,7 +152,6 @@ def baseline_schedule(tasks, profile, user_responses=None, existing=None):
     )
 
     for task in ordered_tasks:
-
         slots = candidate_slots(
             task,
             task.estimated_duration,

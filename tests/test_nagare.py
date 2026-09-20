@@ -92,7 +92,7 @@ def test_baseline_schedule_prioritizes_higher_priority_tasks():
     assert [item.task_id for item in schedule.blocks] == ["high", "low"]
 
 
-def test_baseline_schedule_protects_earlier_deadline_before_priority():
+def test_baseline_schedule_uses_priority_before_deadline():
     schedule = baseline_schedule(
         [
             task("urgent", 60, priority=5, deadline=DAY.replace(hour=17),
@@ -103,7 +103,25 @@ def test_baseline_schedule_protects_earlier_deadline_before_priority():
         profile(window(9, 12)),
     )
 
-    assert [item.task_id for item in schedule.blocks] == ["soon", "urgent"]
+    assert [item.task_id for item in schedule.blocks] == ["urgent", "soon"]
+
+
+def test_higher_priority_assignment_precedes_lower_priority_shopping():
+    schedule = baseline_schedule(
+        [
+            task("assignment", 60, priority=4,
+                 deadline=DAY.replace(hour=18), deadline_type="hard"),
+            task("shopping", 150, priority=3,
+                 deadline=DAY.replace(hour=17), deadline_type="hard"),
+            task("leetcode", 100, priority=4,
+                 deadline=DAY.replace(hour=14), deadline_type="hard"),
+        ],
+        profile(window(9, 21)),
+    )
+
+    assert [item.task_id for item in schedule.blocks] == [
+        "leetcode", "assignment", "shopping"
+    ]
 
 
 def test_baseline_schedule_uses_prior_user_answer_for_undated_ties():
@@ -128,6 +146,19 @@ def test_planner_does_not_use_protected_time():
     assert slots
     assert all(not (start < DAY.replace(hour=12) and end > DAY.replace(hour=10))
                for start, end in slots)
+
+
+def test_planner_reserves_configured_break_between_tasks():
+    user_profile = profile(window(9, 12))
+    user_profile.task_break_minutes = 15
+    schedule = baseline_schedule(
+        [task("first", 60), task("second", 60)],
+        user_profile,
+    )
+
+    first, second = schedule.blocks
+    assert second.start >= first.end + \
+        __import__("datetime").timedelta(minutes=15)
 
 
 def test_reschedule_moves_task_into_a_future_feasible_slot():
@@ -232,6 +263,41 @@ def test_validator_blocks_tasks_missing_from_proposed_schedule():
         conflict.conflict_type == "unresolved_constraint"
         for conflict in result.conflicts
     )
+
+
+def test_impossible_schedule_suspends_for_human_input(tmp_path):
+    store = Store(tmp_path / "impossible-flow.db")
+    run_id = store.create_run("nagare")
+    user_profile = profile(window(9, 10))
+    impossible = task("impossible", duration=120)
+    store.append(
+        run_id,
+        "input",
+        {
+            "profile": user_profile.model_dump(mode="json"),
+            "tasks": [impossible.model_dump(mode="json")],
+            "existing_blocks": [],
+        },
+        produced_by="test",
+    )
+    settings = Settings(
+        api_key="",
+        model="model",
+        fallback_model="fallback",
+        escalation_model="escalation",
+        max_tokens=100,
+        max_tokens_per_run=1000,
+        max_attempts_per_step=2,
+        expert_timeout_minutes=45,
+        langfuse_public="",
+        langfuse_secret="",
+        langfuse_host="",
+    )
+
+    assert runner.advance(
+        store, run_id, build_flow(), settings
+    ) is RunState.AWAITING_EXPERT
+    assert callback.pending(store, run_id)
 
 
 def test_validator_blocks_overlapping_tasks():

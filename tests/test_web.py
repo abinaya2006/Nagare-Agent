@@ -4,6 +4,81 @@ from slice.store import Store
 from web import expert
 
 
+def test_tasks_accept_no_deadline_value():
+    tasks = expert._tasks(
+        "2026-09-19",
+        "Read notes | 30 | 2 | none",
+        "09:00",
+    )
+
+    assert tasks[0].deadline is None
+    assert tasks[0].deadline_type == "none"
+
+
+def test_schedule_form_exposes_break_range_control():
+    page = expert.schedule_form()
+
+    rendered = page.body.decode()
+    assert "task_break_minutes" in rendered
+    assert "type='range'" in rendered or 'type="range"' in rendered
+    assert "protected_blocks" in rendered
+
+
+def test_structured_schedule_choices_create_tasks_and_protected_moments(tmp_path):
+    expert.DB = str(tmp_path / "structured-form.db")
+    client = TestClient(expert.app)
+
+    response = client.post(
+        "/schedule",
+        data={
+            "day": "2026-09-19", "available_start": "09:00",
+            "available_end": "17:00", "morning_energy": "5",
+            "afternoon_energy": "3", "evening_energy": "2",
+            "task_break_minutes": "15", "protected_name": ["Lunch"],
+            "protected_start": ["12:00"], "protected_end": ["13:00"],
+            "task_title": ["Read notes"], "task_minutes": ["30"],
+            "task_priority": ["2"], "task_deadline": [""],
+        },
+    )
+
+    assert response.status_code == 200
+    run = Store(expert.DB).list_runs(limit=1)[0]
+    profile = Store(expert.DB).latest(run["id"], "input")["profile"]
+    assert profile["protected_blocks"][0]["start"] == "2026-09-19T12:00:00"
+    assert Store(expert.DB).latest(run["id"], "input")[
+        "tasks"][0]["deadline"] is None
+
+
+def test_schedule_page_accepts_legacy_tasks_and_adds_around_existing(tmp_path):
+    expert.DB = str(tmp_path / "add-tasks.db")
+    client = TestClient(expert.app)
+    response = client.post(
+        "/schedule",
+        data={
+            "day": "2026-09-19", "available_start": "09:00",
+            "available_end": "17:00", "morning_energy": "5",
+            "afternoon_energy": "3", "evening_energy": "2",
+            "tasks": "Existing | 60 | 3 | none",
+        },
+    )
+    assert response.status_code == 200
+    store = Store(expert.DB)
+    run = store.list_runs(limit=1)[0]
+    assert f"/runs/{run['id']}/add-tasks" in response.text
+
+    updated = client.post(
+        f"/runs/{run['id']}/add-tasks",
+        data={"tasks": "New task | 30 | 5 | none"},
+    )
+
+    assert updated.status_code == 200
+    new_run = store.list_runs(limit=1)[0]
+    task_ids = [task["id"]
+                for task in store.latest(new_run["id"], "input")["tasks"]]
+    assert task_ids == ["task-001", "task-002"]
+    assert "New task" in updated.text
+
+
 def test_pending_queue_keeps_remaining_minutes_for_partial_task():
     pending = expert._pending_tasks(
         {

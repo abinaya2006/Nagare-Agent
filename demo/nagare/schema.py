@@ -70,6 +70,7 @@ class UserScheduleProfile(BaseModel):
 
     preferred_session_length: int = Field(gt=0)
     preferred_break_length: int = Field(gt=0)
+    task_break_minutes: int = Field(default=0, ge=0, le=60)
 
     sleep_window: TimeWindow
 

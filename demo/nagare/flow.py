@@ -38,7 +38,7 @@ def build_draft_messages(context: dict, prior: dict | None,
             "1. Fit all tasks into the available_windows. Do NOT overlap tasks.\n"
             "2. Preserve all locked/protected blocks exactly as they are.\n"
             "3. Treat hard deadlines as feasibility constraints first. Among tasks that can be safely placed, "
-            "prefer the earliest deadline, then higher priority. For undated ties, use the user's prior answers.\n"
+            "prefer higher priority, then the earliest deadline. For undated ties, use the user's prior answers.\n"
             "4. If an 'expert_answer' is provided, follow the user's instructions EXACTLY. "
             "(e.g., if they say 'move it to tomorrow', place it in tomorrow's available window. "
             "If they say 'split it', output two ScheduleBlocks for the same task_id).\n"
