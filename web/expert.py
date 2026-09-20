@@ -51,6 +51,37 @@ def _store() -> Store:
     return Store(DB)
 
 
+def _pending_tasks(payload: dict, schedule: dict) -> list[dict]:
+    scheduled_minutes = {}
+    for block in schedule.get("blocks", []):
+        if block.get("block_type") != "task" or not block.get("task_id"):
+            continue
+        start = datetime.fromisoformat(block["start"])
+        end = datetime.fromisoformat(block["end"])
+        minutes = int((end - start).total_seconds() // 60)
+        scheduled_minutes[block["task_id"]] = scheduled_minutes.get(
+            block["task_id"], 0) + minutes
+
+    pending = []
+    for task in payload.get("tasks", []):
+        remaining = schedule.get("pending_minutes", {}).get(task["id"])
+        if remaining is None:
+            remaining = task["estimated_duration"] - \
+                scheduled_minutes.get(task["id"], 0)
+        if remaining <= 0:
+            continue
+        pending.append({
+            "id": task["id"],
+            "title": task["title"],
+            "description": task.get("description"),
+            "deadline": task.get("deadline"),
+            "estimated_minutes": remaining,
+            "priority": task.get("priority", "medium"),
+            "status": "pending",
+        })
+    return pending
+
+
 def _datetime(day: str, value: str) -> datetime:
     return datetime.combine(date.fromisoformat(day), time.fromisoformat(value))
 
@@ -243,33 +274,32 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
             continue
         payload = store.latest(run["id"], "input") or {}
         schedule = store.latest(run["id"], "proposed_schedule") or {}
-        scheduled_ids = {
-            block.get("task_id") for block in schedule.get("blocks", [])
-            if block.get("block_type") == "task" and block.get("task_id")
-        }
-        completed_ids = {
-            (focus_input.get("selected_task_id"), focus_input.get(
-                "context", {}).get("source_schedule_run_id"))
-            for focus_run in store.list_runs(limit=100)
-            if focus_run["domain"] == "nagare_focus"
-            for focus_input in [store.latest(focus_run["id"], "input") or {}]
-            if focus_input.get("context", {}).get("source_schedule_run_id") == run["id"]
-            and (store.latest(focus_run["id"], "focus_outcome") or {}).get("status") == "completed"
-        }
-        pending = [
-            {
-                "id": task["id"],
-                "title": task["title"],
-                "description": task.get("description"),
-                "deadline": task.get("deadline"),
-                "estimated_minutes": task["estimated_duration"],
-                "priority": task.get("priority", "medium"),
-                "status": "pending",
-            }
-            for task in payload.get("tasks", [])
-            if task.get("id") not in scheduled_ids
-            and (task.get("id"), run["id"]) not in completed_ids
-        ]
+        completed_ids = set()
+        consumed_minutes = {}
+        for focus_run in store.list_runs(limit=100):
+            if focus_run["domain"] != "nagare_focus":
+                continue
+            focus_input = store.latest(focus_run["id"], "input") or {}
+            if focus_input.get("context", {}).get("source_schedule_run_id") != run["id"]:
+                continue
+            task_id = focus_input.get("selected_task_id")
+            outcome = store.latest(focus_run["id"], "focus_outcome") or {}
+            status = outcome.get("status")
+            if status == "completed":
+                completed_ids.add(task_id)
+            elif status in {"started", "started_breakdown", "partially_completed"}:
+                consumed_minutes[task_id] = consumed_minutes.get(task_id, 0) + outcome.get(
+                    "duration_minutes", 0
+                )
+
+        pending = []
+        for task in _pending_tasks(payload, schedule):
+            if task["id"] in completed_ids:
+                continue
+            remaining = task["estimated_minutes"] - \
+                consumed_minutes.get(task["id"], 0)
+            if remaining > 0:
+                pending.append({**task, "estimated_minutes": remaining})
         return run["id"], pending
     return None, []
 
@@ -318,23 +348,7 @@ def create_focus(selected_task_id: str = Form(...), schedule_run_id: str = Form(
             raise ValueError("That schedule run is not a Nagare schedule.")
         source = store.latest(schedule_run_id, "input") or {}
         schedule = store.latest(schedule_run_id, "proposed_schedule") or {}
-        scheduled_ids = {
-            block.get("task_id") for block in schedule.get("blocks", [])
-            if block.get("block_type") == "task" and block.get("task_id")
-        }
-        parsed = [
-            {
-                "id": task["id"],
-                "title": task["title"],
-                "description": task.get("description"),
-                "deadline": task.get("deadline"),
-                "estimated_minutes": task["estimated_duration"],
-                "priority": task.get("priority", "medium"),
-                "status": "pending",
-            }
-            for task in source.get("tasks", [])
-            if task.get("id") not in scheduled_ids
-        ]
+        parsed = _pending_tasks(source, schedule)
         if selected_task_id not in {item["id"] for item in parsed}:
             raise ValueError("Select a task from the read-only pending queue.")
         run_id, _ = _run_focus(
@@ -368,8 +382,12 @@ def record_focus_outcome(run_id: str, status: str = Form(...)):
     if status not in {"completed", "partially_completed", "not_completed"}:
         return _page("Invalid outcome", "<h1>Invalid outcome</h1>")
     task_id = (store.latest(run_id, "input") or {}).get("selected_task_id")
+    recommendation = store.latest(run_id, "focus_recommendation") or {}
     store.append(run_id, "focus_outcome", {
-                 "task_id": task_id, "status": status}, produced_by="user")
+                 "task_id": task_id, "status": status,
+                 "duration_minutes": recommendation.get("suggested_duration_minutes", 0)
+                 if status in {"completed", "partially_completed"} else 0},
+                 produced_by="user")
     return _page("Outcome recorded", _focus_html(run_id))
 
 # --- (The rest of the UI rendering code in web/expert.py remains identical) ---
@@ -383,13 +401,36 @@ def _schedule_html(run_id: str) -> str:
     failure = store.latest(run_id, "failure")
     tasks = {task["id"]: task for task in input_data.get("tasks", [])}
 
+    def render_row(block: dict, replaced: bool = False) -> str:
+        title = html.escape(tasks.get(
+            block.get("task_id"), {}).get("title", block.get("block_type", "block")))
+        time_label = (
+            f"{html.escape(block['start'][8:16].replace('T', ' '))} - "
+            f"{html.escape(block['end'][11:16])}"
+        )
+        status = "Replaced" if replaced else (
+            "Locked" if block.get("locked") else "Movable"
+        )
+        row_class = " class='replaced-row'" if replaced else ""
+        return (
+            f"<tr{row_class}><td>{time_label}</td>"
+            f"<td>{'<s>' + title + '</s>' if replaced else title}</td>"
+            f"<td>{status}</td></tr>"
+        )
+
     rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(block['start'][8:16].replace('T', ' '))} - {html.escape(block['end'][11:16])}</td>"
-        f"<td>{html.escape(tasks.get(block.get('task_id'), {}).get('title', block.get('block_type', 'block')))}</td>"
-        f"<td>{'Locked' if block.get('locked') else 'Movable'}</td></tr>"
+        render_row(block)
         for block in schedule.get("blocks", [])
-    ) or "<tr><td colspan='3'>No task could be placed in the available windows.</td></tr>"
+    )
+    replaced_task_id = input_data.get("rescheduled_task_id")
+    previous_schedule = input_data.get("previous_schedule", {})
+    if replaced_task_id:
+        rows = "".join(
+            render_row(block, replaced=True)
+            for block in previous_schedule.get("blocks", [])
+            if block.get("task_id") == replaced_task_id
+        ) + rows
+    rows = rows or "<tr><td colspan='3'>No task could be placed in the available windows.</td></tr>"
 
     options = "".join(
         f"<option value='{html.escape(task_id)}'>{html.escape(task['title'])}</option>"
@@ -401,24 +442,23 @@ def _schedule_html(run_id: str) -> str:
     if pending:
         question = pending[0]
         conflict_items = question.context.get("conflicts", [])
-        conflict_html = ""
-        if conflict_items:
-            conflict_html = "<div class='conflict-list'>" + "".join(
-                "<div class='conflict-item'>"
-                f"<strong>{html.escape(tasks.get(item.get('task_id'), {}).get('title', 'Unscheduled task'))}</strong>"
-                f"<span>{html.escape(item.get('explanation', 'No safe slot was found.'))}</span>"
-                "</div>"
-                for item in conflict_items
-            ) + "</div>"
+        diagnosis = question.context.get("diagnosis")
+        conflict_html = (
+            f"<div class='conflict-item'><strong>Nagare found a conflict</strong>"
+            f"<span>{html.escape(diagnosis)}</span></div>"
+            if diagnosis else ""
+        )
         has_fragmentation = any(
             item.get("conflict_type") == "fragmentation"
             for item in conflict_items
         )
         if has_fragmentation:
+            recommended_id = question.context.get("recommended_task_id")
+            split_value = "split " + recommended_id if recommended_id else "fragment the task"
             decision_controls = (
                 f"<form method='post' action='/q/{html.escape(question.id)}' class='decision-actions'>"
                 "<input type='hidden' name='who' value='user'>"
-                "<button type='submit' name='answer' value='fragment the task'>Split this task</button>"
+                f"<button type='submit' name='answer' value='{html.escape(split_value)}'>Split recommended task</button>"
                 "<button type='submit' name='answer' value='move the task to tomorrow' class='button-secondary'>Move task to tomorrow</button>"
                 f"<a class='button-link' href='/q/{html.escape(question.id)}'>Other answer</a></form>"
             )
@@ -590,10 +630,17 @@ def reschedule(run_id: str, task_id: str = Form(...), reason: str = Form("")):
         schedule = store.latest(run_id, "proposed_schedule")
         if payload is None or schedule is None:
             raise ValueError("That schedule run no longer exists.")
-        payload["existing_blocks"] = schedule.get("blocks", [])
-        payload["missed_task_id"] = task_id
-        payload["reason"] = reason.strip() or "The task was interrupted."
-        new_run_id, _ = _run_schedule(payload)
+        tasks = payload.get("tasks", [])
+        if task_id not in {task.get("id") for task in tasks}:
+            raise ValueError("That task is not part of this schedule.")
+        next_payload = dict(payload)
+        next_payload["existing_blocks"] = schedule.get("blocks", [])
+        next_payload["missed_task_id"] = task_id
+        next_payload["reason"] = reason.strip() or "The task was interrupted."
+        next_payload["rescheduled_task_id"] = task_id
+        next_payload["rescheduled_from_run_id"] = run_id
+        next_payload["previous_schedule"] = schedule
+        new_run_id, _ = _run_schedule(next_payload)
         return _page("Schedule updated", _schedule_html(new_run_id))
     except (KeyError, ValueError, TypeError) as exc:
         return _page("Reschedule error", f"<h1>Could not reschedule that task</h1><p class='error'>{html.escape(str(exc))}</p><p><a href='/schedule'>Create a new schedule</a></p>")

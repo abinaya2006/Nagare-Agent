@@ -4,6 +4,27 @@ from slice.store import Store
 from web import expert
 
 
+def test_pending_queue_keeps_remaining_minutes_for_partial_task():
+    pending = expert._pending_tasks(
+        {
+            "tasks": [{"id": "essay", "title": "Write essay",
+                       "estimated_duration": 120}],
+        },
+        {
+            "blocks": [{
+                "id": "block_essay_1",
+                "task_id": "essay",
+                "start": "2026-09-19T09:00:00",
+                "end": "2026-09-19T10:00:00",
+                "block_type": "task",
+            }],
+        },
+    )
+
+    assert pending[0]["id"] == "essay"
+    assert pending[0]["estimated_minutes"] == 60
+
+
 def test_schedule_form_generates_and_reschedules(tmp_path):
     expert.DB = str(tmp_path / "web.db")
     client = TestClient(expert.app)
@@ -34,6 +55,9 @@ def test_schedule_form_generates_and_reschedules(tmp_path):
 
     assert rescheduled.status_code == 200
     assert "Schedule updated" in rescheduled.text
+    assert "<s>Write report</s>" in rescheduled.text
+    assert "Replaced" in rescheduled.text
+    assert rescheduled.text.count("Write report") >= 2
     assert len(store.list_runs(limit=2)) == 2
 
 
@@ -125,6 +149,9 @@ def test_focus_web_flow_accepts_selected_task_and_records_outcome(tmp_path):
     assert answered.status_code == 200
     assert store.get_state(run["id"]).value == "complete"
     assert store.latest(run["id"], "focus_outcome")["status"] == "started"
+    remaining_queue = client.get("/focus")
+    assert remaining_queue.status_code == 200
+    assert "60 min" in remaining_queue.text
 
     completed = client.post(
         f"/focus/runs/{run['id']}/outcome",
@@ -181,7 +208,7 @@ def test_schedule_conflict_shortening_shows_updated_schedule(tmp_path):
     expert.DB = str(tmp_path / "shorten.db")
     client = TestClient(expert.app)
 
-    response = client.post(
+    client.post(
         "/schedule",
         data={
             "day": "2026-09-19",

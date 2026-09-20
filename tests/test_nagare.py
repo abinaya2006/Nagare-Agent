@@ -92,6 +92,33 @@ def test_baseline_schedule_prioritizes_higher_priority_tasks():
     assert [item.task_id for item in schedule.blocks] == ["high", "low"]
 
 
+def test_baseline_schedule_protects_earlier_deadline_before_priority():
+    schedule = baseline_schedule(
+        [
+            task("urgent", 60, priority=5, deadline=DAY.replace(hour=17),
+                 deadline_type="hard"),
+            task("soon", 60, priority=3, deadline=DAY.replace(hour=12),
+                 deadline_type="hard"),
+        ],
+        profile(window(9, 12)),
+    )
+
+    assert [item.task_id for item in schedule.blocks] == ["soon", "urgent"]
+
+
+def test_baseline_schedule_uses_prior_user_answer_for_undated_ties():
+    schedule = baseline_schedule(
+        [
+            task("essay", 60, title="Write essay", priority=3),
+            task("slides", 60, title="Prepare slides", priority=3),
+        ],
+        profile(window(9, 12)),
+        user_responses=["Prepare slides first"],
+    )
+
+    assert [item.task_id for item in schedule.blocks] == ["slides", "essay"]
+
+
 def test_planner_does_not_use_protected_time():
     user_profile = profile(window(9, 17))
     user_profile.protected_blocks = [window(10, 12)]
@@ -117,8 +144,8 @@ def test_reschedule_moves_task_into_a_future_feasible_slot():
     )
 
     moved = next(item for item in schedule.blocks if item.task_id == "ml")
-    assert moved.start == DAY.replace(hour=9)
-    assert moved.end == DAY.replace(hour=11)
+    assert moved.start == DAY.replace(hour=11)
+    assert moved.end == DAY.replace(hour=13)
     assert moved.id == "block_ml"
 
 
@@ -159,7 +186,7 @@ def test_flow_reschedule_replaces_missed_block_instead_of_duplicating(tmp_path):
     blocks = store.latest(run_id, "decision")["schedule"]["blocks"]
     assert len(blocks) == 1
     assert blocks[0]["task_id"] == "ml"
-    assert blocks[0]["start"] == "2026-09-19T09:00:00"
+    assert blocks[0]["start"] == "2026-09-19T11:00:00"
 
 
 def test_reschedule_preserves_locked_blocks():
@@ -408,6 +435,52 @@ def test_fragmented_task_can_pass_before_deadline():
 
     assert len(schedule.blocks) == 3
     assert result.status == "PASS"
+
+
+def test_fragmented_task_keeps_unplaced_remainder_pending():
+    user_profile = profile(window(10, 12))
+    urgent = task(
+        duration=120,
+        deadline=DAY.replace(hour=11, minute=30),
+        deadline_type="hard",
+    )
+
+    schedule = fragment_task(urgent, user_profile)
+    result = validate_schedule(schedule, [urgent], user_profile, [])
+
+    assert sum(
+        int((item.end - item.start).total_seconds() // 60)
+        for item in schedule.blocks
+        if item.task_id == urgent.id
+    ) == 90
+    assert schedule.pending_minutes == {urgent.id: 30}
+    assert result.status == "PASS"
+
+
+def test_split_replan_schedules_remaining_tasks_around_fragments():
+    user_profile = profile(window(11, 17))
+    user_profile.protected_blocks = [window(12, 13)]
+    urgent = task(
+        "urgent",
+        duration=120,
+        deadline=DAY.replace(hour=14),
+        deadline_type="hard",
+        fragmentable=True,
+        min_fragment_duration=60,
+        preferred_fragment_duration=60,
+    )
+    remaining = task("remaining", duration=60, priority=2)
+    fragments = fragment_task(urgent, user_profile)
+    schedule = baseline_schedule(
+        [remaining],
+        user_profile,
+        existing=fragments.blocks,
+    )
+
+    assert [item.task_id for item in schedule.blocks] == [
+        "urgent", "urgent", "remaining"
+    ]
+    assert schedule.blocks[-1].start == DAY.replace(hour=14)
 
 
 def test_agent_loop_asks_and_resolves_fragmentation(tmp_path):

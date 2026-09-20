@@ -6,21 +6,22 @@ and the runner supplies the bounded back-edge for revisions and escalation.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 
 from slice import callback
 from slice.llm import ModelError
 from slice.records import RunState
 
+from .planner import _protected, baseline_schedule, fragment_task, reschedule_task
 from .schema import (
     ProposedSchedule,
     RescheduleAttempt,
-    ScheduleValidationResult,
     ScheduleBlock,
+    ScheduleValidationResult,
     Task,
     UserScheduleProfile,
 )
-from .planner import baseline_schedule, fragment_task, reschedule_task
 from .validator import validate_schedule
 
 
@@ -36,10 +37,12 @@ def build_draft_messages(context: dict, prior: dict | None,
             "RULES:\n"
             "1. Fit all tasks into the available_windows. Do NOT overlap tasks.\n"
             "2. Preserve all locked/protected blocks exactly as they are.\n"
-            "3. If an 'expert_answer' is provided, follow the user's instructions EXACTLY. "
+            "3. Treat hard deadlines as feasibility constraints first. Among tasks that can be safely placed, "
+            "prefer the earliest deadline, then higher priority. For undated ties, use the user's prior answers.\n"
+            "4. If an 'expert_answer' is provided, follow the user's instructions EXACTLY. "
             "(e.g., if they say 'move it to tomorrow', place it in tomorrow's available window. "
             "If they say 'split it', output two ScheduleBlocks for the same task_id).\n"
-            "4. Keep the reasoning string under 160 characters."
+            "5. Keep the reasoning string under 160 characters."
         )},
         {"role": "user", "content": json.dumps(
             {"context": context, "previous_schedule": prior,
@@ -94,23 +97,76 @@ def build_flow(call=None):
         return len(ctx.history("reschedule_attempt")) >= MAX_REVISIONS
 
     def _ask_user(ctx, validation: ScheduleValidationResult) -> RunState:
+        tasks, profile, _ = _models(ctx)
+        task_by_id = {task.id: task for task in tasks}
         has_fragmentation = any(
             conflict.conflict_type == "fragmentation"
             for conflict in validation.conflicts
         )
-        question = (
-            "A task cannot fit as one session before its deadline. Should I "
-            "fragment it into smaller sessions, or move something else to tomorrow?"
-            if has_fragmentation else
-            "I couldn't find a safe slot without breaking rules. How should I resolve this? "
-            "(e.g., 'Move task X to tomorrow', 'Shorten task Y to 30 mins', 'Split it up')"
-        )
+        candidates = [
+            task_by_id[conflict.task_id]
+            for conflict in validation.conflicts
+            if conflict.task_id in task_by_id
+            and conflict.conflict_type in {"fragmentation", "duration", "unresolved_constraint"}
+        ]
+        candidates.sort(key=lambda task: (
+            task.deadline is None,
+            task.deadline.isoformat() if task.deadline else "9999-12-31T23:59:59",
+            -task.priority,
+        ))
+        recommended = candidates[0] if candidates else None
+        diagnosis = "Nagare found a scheduling conflict."
+        available_minutes = 0
+        for window in profile.available_windows:
+            cursor = window.start
+            while cursor < window.end:
+                next_cursor = min(cursor + timedelta(minutes=15), window.end)
+                if not _protected(cursor, next_cursor, profile):
+                    available_minutes += int(
+                        (next_cursor - cursor).total_seconds() // 60
+                    )
+                cursor = next_cursor
+        requested_minutes = sum(task.estimated_duration for task in tasks)
+        overload = max(0, requested_minutes - available_minutes)
+        if overload:
+            diagnosis = f"Nagare found a scheduling conflict: your day is overloaded by {overload} minutes."
+        if recommended is not None:
+            matching = next(
+                conflict for conflict in validation.conflicts
+                if conflict.task_id == recommended.id
+            )
+            diagnosis = (
+                f"{diagnosis} {recommended.title} is at risk: {matching.explanation} "
+                "I recommend protecting this task first."
+            )
+            if recommended.deadline and profile.available_windows:
+                available_until = max(
+                    window.end for window in profile.available_windows
+                )
+                diagnosis += (
+                    f" The day remains available until {available_until.strftime('%H:%M')}, "
+                    f"but {recommended.title} must be completed by "
+                    f"{recommended.deadline.strftime('%H:%M')}; time after that deadline "
+                    "cannot repair this task."
+                )
+        if has_fragmentation:
+            question = (
+                f"{diagnosis} Options: 1) split or fragment {recommended.title if recommended else 'the task'} "
+                "2) move it to tomorrow 3) rebalance a lower-priority task. What should I do?"
+            )
+        else:
+            question = (
+                f"{diagnosis} Options: 1) move the task to tomorrow 2) shorten it "
+                "3) rebalance a lower-priority task. What should I do?"
+            )
         callback.ask(
             ctx.store,
             ctx.run_id,
             question,
             {
                 "conflicts": [c.model_dump(mode="json") for c in validation.conflicts],
+                "diagnosis": diagnosis,
+                "recommended_task_id": recommended.id if recommended else None,
                 "resume_state": RunState.DRAFTING.value,
             },
             ctx.settings,
@@ -146,14 +202,81 @@ def build_flow(call=None):
                 for item in (ctx.latest("validation") or {}).get("conflicts", [])
                 if item.get("conflict_type") == "fragmentation"
             }
-            task_to_fragment = next(
-                (item for item in tasks if item.id in conflict_ids), None)
-            if task_to_fragment is not None:
+            selected_task_id = None
+            if answer:
+                question = ctx.store.get_question(answer.get("question_id"))
+                selected_task_id = (question.context or {}).get(
+                    "recommended_task_id") if question else None
+            tasks_to_fragment = [
+                item for item in tasks
+                if item.id in conflict_ids
+                and (selected_task_id is None or item.id == selected_task_id)
+            ]
+            if tasks_to_fragment:
+                task_to_fragment = tasks_to_fragment[0]
+                fragment = fragment_task(task_to_fragment, profile, existing)
+                remaining_tasks = [
+                    task for task in tasks if task.id != task_to_fragment.id
+                ]
+                replanned = baseline_schedule(
+                    remaining_tasks,
+                    profile,
+                    user_responses=[
+                        item.payload.get("answer", "")
+                        for item in ctx.history("expert_answer")
+                    ],
+                    existing=fragment.blocks,
+                )
+                split_schedule = replanned.model_copy(update={
+                    "pending_minutes": fragment.pending_minutes,
+                })
                 ctx.append(
                     "proposed_schedule",
-                    fragment_task(task_to_fragment, profile,
-                                  existing).model_dump(mode="json"),
+                    split_schedule.model_dump(mode="json"),
                     produced_by="planner:human_fragmentation",
+                )
+                return RunState.GATING
+
+        if answer_text and ("rebalanc" in answer_text or "rebanc" in answer_text):
+            selected_task_id = None
+            if answer:
+                question = ctx.store.get_question(answer.get("question_id"))
+                selected_task_id = (question.context or {}).get(
+                    "recommended_task_id") if question else None
+            protected_task = next(
+                (task for task in tasks if task.id == selected_task_id), None)
+            lower_priority = [
+                task for task in tasks
+                if task.id != selected_task_id
+                and (protected_task is None or task.priority < protected_task.priority)
+            ]
+            lower_priority.sort(key=lambda task: (
+                task.priority,
+                task.deadline is not None,
+                task.deadline.isoformat() if task.deadline else "9999-12-31T23:59:59",
+            ))
+            if lower_priority:
+                deferred = lower_priority[0]
+                replanned = baseline_schedule(
+                    [task for task in tasks if task.id != deferred.id],
+                    profile,
+                    user_responses=[
+                        item.payload.get("answer", "")
+                        for item in ctx.history("expert_answer")
+                    ],
+                    existing=existing,
+                )
+                rebalanced = replanned.model_copy(update={
+                    "pending_minutes": {
+                        **replanned.pending_minutes,
+                        deferred.id: deferred.estimated_duration,
+                    },
+                    "deferred_task_ids": [deferred.id],
+                })
+                ctx.append(
+                    "proposed_schedule",
+                    rebalanced.model_dump(mode="json"),
+                    produced_by="planner:human_rebalance",
                 )
                 return RunState.GATING
 
@@ -206,6 +329,10 @@ def build_flow(call=None):
             "existing_blocks": [block.model_dump(mode="json") for block in existing],
             "missed_task_id": missed_task_id,
             "reason": payload.get("reason"),
+            "prior_user_responses": [
+                item.payload.get("answer", "")
+                for item in ctx.history("expert_answer")
+            ],
         }
 
         prior = ctx.latest("proposed_schedule")
@@ -215,15 +342,23 @@ def build_flow(call=None):
             missed_task = next(
                 (t for t in tasks if t.id == missed_task_id), None)
             if missed_task is not None:
+                remaining_minutes = missed_task.estimated_duration
                 return reschedule_task(
                     missed_task,
-                    missed_task.estimated_duration,
+                    remaining_minutes,
                     existing,
                     tasks,
                     profile,
                     excluded_block_id=missed_task.id,
                 )
-            return baseline_schedule(tasks, profile)
+            return baseline_schedule(
+                tasks,
+                profile,
+                user_responses=[
+                    item.payload.get("answer", "")
+                    for item in ctx.history("expert_answer")
+                ],
+            )
 
         used_agent = call is not None
         if used_agent:

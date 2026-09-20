@@ -336,8 +336,12 @@ def build_focus_flow(call=None):
             ctx.append("breakdown_decision", {
                        "task_id": task.id, "decision": "accepted" if accepted else "rejected", "answer": answer_text}, produced_by="user")
             if accepted:
-                ctx.append("focus_outcome", {"task_id": task.id, "status": "started_breakdown", "breakdown": ctx.latest(
-                    "breakdown_action")}, produced_by="user")
+                ctx.append("focus_outcome", {
+                    "task_id": task.id,
+                    "status": "started_breakdown",
+                    "duration_minutes": ctx.latest("breakdown_action")["estimated_minutes"],
+                    "breakdown": ctx.latest("breakdown_action"),
+                }, produced_by="user")
                 _append_state(ctx, "working",
                               "The user accepted the smaller action.")
                 return RunState.COMPLETE

@@ -18,6 +18,10 @@ def validate_schedule(
     def available_minutes_before_deadline(task):
         if task.deadline is None:
             return 0
+        occupied_blocks = [
+            block for block in schedule.blocks
+            if block.task_id != task.id
+        ] + list(locked_blocks)
         total = 0
         for window in profile.available_windows:
             end = min(window.end, task.deadline)
@@ -28,7 +32,7 @@ def validate_schedule(
                 next_cursor = min(cursor + timedelta(minutes=15), end)
                 if not _protected(cursor, next_cursor, profile) and not any(
                     _overlaps(cursor, next_cursor, block)
-                    for block in locked_blocks
+                    for block in occupied_blocks
                 ):
                     total += int((next_cursor - cursor).total_seconds() // 60)
                 cursor = next_cursor
@@ -53,8 +57,14 @@ def validate_schedule(
             )
 
     for task in tasks:
+        if task.id in getattr(schedule, "deferred_task_ids", []):
+            continue
         if task.id in scheduled_task_ids:
-            if scheduled_minutes.get(task.id, 0) < task.estimated_duration:
+            remaining = task.estimated_duration - \
+                scheduled_minutes.get(task.id, 0)
+            accepted_pending = getattr(
+                schedule, "pending_minutes", {}).get(task.id, 0)
+            if remaining > 0 and accepted_pending != remaining:
                 conflicts.append(
                     Conflict(
                         task_id=task.id,
@@ -64,7 +74,7 @@ def validate_schedule(
                         explanation=(
                             f"Task '{task.title}' has only "
                             f"{scheduled_minutes[task.id]} of {task.estimated_duration} "
-                            "minutes scheduled."
+                            f"minutes scheduled; {remaining} remain pending."
                         ),
                     )
                 )
@@ -76,12 +86,12 @@ def validate_schedule(
             "available time without violating a constraint."
         )
         available_minutes = available_minutes_before_deadline(task)
+        occupied_blocks = [
+            block for block in schedule.blocks
+            if block.task_id != task.id
+        ] + list(locked_blocks)
         no_single_slot = bool(task.deadline) and not candidate_slots(
-            task,
-            task.estimated_duration,
-            profile,
-            locked_blocks,
-        )
+            task, task.estimated_duration, profile, occupied_blocks)
         if task.deadline and 0 < available_minutes < task.estimated_duration:
             conflict_type = "fragmentation"
             explanation = (

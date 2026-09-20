@@ -113,10 +113,24 @@ def candidate_slots(task, duration, profile, blocks):
     return slots
 
 
-def baseline_schedule(tasks, profile):
-    blocks = []
+def _response_task_order(tasks, user_responses):
+    """Return the order in which prior user answers mention undated tasks."""
+    order = {}
+    responses = user_responses or []
+    for response in reversed(responses):
+        answer = str(response).lower()
+        for task in tasks:
+            if task.id.lower() in answer or task.title.lower() in answer:
+                order.setdefault(task.id, len(order))
+    return order
 
-    # Fixed tasks first, then deadline, priority and consequence
+
+def baseline_schedule(tasks, profile, user_responses=None, existing=None):
+    blocks = list(existing or [])
+
+    response_order = _response_task_order(tasks, user_responses)
+
+    # Fixed tasks first, then deadline, priority, and user direction.
     ordered_tasks = sorted(
         tasks,
         key=lambda task: (
@@ -124,6 +138,7 @@ def baseline_schedule(tasks, profile):
             task.deadline is None,
             task.deadline.isoformat() if task.deadline else "9999-12-31T23:59:59",
             -task.priority,
+            response_order.get(task.id, len(response_order)),
             -task.consequence_of_delay,
             task.id,
         ),
@@ -174,6 +189,9 @@ def fragment_task(task, profile, existing=None):
     while remaining > 0:
         duration = min(fragment_length, remaining)
         slots = candidate_slots(task, duration, profile, blocks)
+        while not slots and duration > (task.min_fragment_duration or 1):
+            duration -= task.min_fragment_duration or 1
+            slots = candidate_slots(task, duration, profile, blocks)
         if not slots:
             break
         start, end = slots[0]
@@ -189,7 +207,12 @@ def fragment_task(task, profile, existing=None):
         fragment_number += 1
 
     blocks.sort(key=lambda block: block.start)
-    return ProposedSchedule(blocks=blocks, conflicts=[], reschedule_attempts=[])
+    return ProposedSchedule(
+        blocks=blocks,
+        pending_minutes={task.id: remaining} if remaining else {},
+        conflicts=[],
+        reschedule_attempts=[],
+    )
 
 
 def reschedule_task(
@@ -212,12 +235,16 @@ def reschedule_task(
     """
 
     kept = []
+    removed = []
 
     for block in existing:
         # The current schema may not have block.id.
         # Therefore we use task_id when identifying the
         # block that belongs to the missed task.
-        if excluded_block_id is not None and block.task_id == excluded_block_id:
+        if excluded_block_id is not None and (
+            block.id == excluded_block_id or block.task_id == excluded_block_id
+        ):
+            removed.append(block)
             continue
 
         kept.append(block)
@@ -228,6 +255,18 @@ def reschedule_task(
         profile,
         kept,
     )
+
+    if removed:
+        previous_end = max(block.end for block in removed)
+        future_slots = [
+            slot for slot in slots
+            if slot[0] >= previous_end
+        ]
+        different_slots = [
+            slot for slot in slots
+            if all(slot != (block.start, block.end) for block in removed)
+        ]
+        slots = future_slots or different_slots
 
     if not slots:
         return ProposedSchedule(
