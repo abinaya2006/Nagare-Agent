@@ -11,19 +11,6 @@ that Nagare does not silently accept an incomplete or impossible schedule.
 
 ## Scenarios
 
-### Past-time scheduling
-
-Use a same-day schedule after the availability window has begun.
-
-Expected behavior:
-
-- The initial schedule respects the configured availability window.
-- Add-task and reschedule operations do not place new work before the current time.
-- A completed past task is not silently recreated without a user action.
-
-This was a previous failure: the schedule began at the initial available time
-regardless of when the request was made, which allowed past scheduling.
-
 ### Deadline and priority pressure
 
 ```text
