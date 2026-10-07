@@ -29,11 +29,17 @@ separate tunneled link.
 from __future__ import annotations
 
 import html
+import base64
+import hashlib
+import hmac
+import json
 import os
+import sqlite3
+import time as clock
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from demo.nagare.flow import build_flow
@@ -46,10 +52,191 @@ from slice.store import Store
 
 DB = os.environ.get("SLICE_DB", "run.db")
 app = FastAPI(title="Nagare — schedule check-in")
+SESSION_SECRET = os.environ.get(
+    "NAGARE_SESSION_SECRET", "local-development-secret")
+REQUEST_LIMIT = 60
+MODEL_CALL_LIMIT = 20
+_REQUESTS = {}
+_MODEL_CALLS = {}
 
 
 def _store() -> Store:
     return Store(DB)
+
+
+def _auth_db() -> sqlite3.Connection:
+    db = sqlite3.connect(DB)
+    db.execute("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)")
+    db.commit()
+    return db
+
+
+def _password_hash(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return base64.urlsafe_b64encode(salt + digest).decode()
+
+
+def _password_matches(password: str, encoded: str) -> bool:
+    raw = base64.urlsafe_b64decode(encoded.encode())
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), raw[:16], 200_000)
+    return hmac.compare_digest(raw[16:], digest)
+
+
+def _session_value(user_id: str) -> str:
+    payload = f"{user_id}:{int(clock.time()) + 86400}"
+    signature = hmac.new(SESSION_SECRET.encode(),
+                         payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
+
+
+def _session_user(request: Request) -> str | None:
+    token = request.cookies.get("nagare_session")
+    if not token:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        user_id, expires, signature = raw.rsplit(":", 2)
+        payload = f"{user_id}:{expires}"
+        expected = hmac.new(SESSION_SECRET.encode(),
+                            payload.encode(), hashlib.sha256).hexdigest()
+        if int(expires) < int(clock.time()) or not hmac.compare_digest(signature, expected):
+            return None
+        return user_id
+    except (ValueError, TypeError):
+        return None
+
+
+def _csrf_valid(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    host = request.headers.get("host", "")
+    if origin and host not in origin:
+        return False
+    if referer and host not in referer:
+        return False
+    supplied = request.headers.get("x-csrf-token")
+    return bool(supplied and hmac.compare_digest(supplied, request.cookies.get("nagare_csrf", "")))
+
+
+def _allow_request(user_id: str) -> bool:
+    now = clock.time()
+    recent = [value for value in _REQUESTS.get(
+        user_id, []) if now - value < 60]
+    if len(recent) >= REQUEST_LIMIT:
+        return False
+    recent.append(now)
+    _REQUESTS[user_id] = recent
+    return True
+
+
+@app.middleware("http")
+async def require_session(request: Request, call_next):
+    if request.url.path in {"/login", "/register"}:
+        return await call_next(request)
+    user_id = _session_user(request)
+    if user_id is None:
+        return HTMLResponse("Authentication required", status_code=401)
+    if not _allow_request(user_id):
+        return HTMLResponse("Request limit exceeded", status_code=429)
+    if request.method == "POST" and not _csrf_valid(request):
+        return HTMLResponse("CSRF validation failed", status_code=403)
+    request.state.user_id = user_id
+    return await call_next(request)
+
+
+def _owned_run(store: Store, run_id: str, user_id: str) -> bool:
+    try:
+        return store.meta(run_id).get("owner_id") == user_id
+    except KeyError:
+        return False
+
+
+def _require_owned(store: Store, run_id: str, user_id: str) -> None:
+    if not _owned_run(store, run_id, user_id):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _allow_model_call(user_id: str) -> bool:
+    now = clock.time()
+    recent = [value for value in _MODEL_CALLS.get(
+        user_id, []) if now - value < 3600]
+    if len(recent) >= MODEL_CALL_LIMIT:
+        return False
+    recent.append(now)
+    _MODEL_CALLS[user_id] = recent
+    return True
+
+
+def _auth_page(message: str = "") -> HTMLResponse:
+    return _page(
+        "Log in",
+        "<h1>Log in to Nagare</h1>"
+        f"<p class='error'>{html.escape(message)}</p>" if message else
+        "<h1>Log in to Nagare</h1>"
+        "<form method='post' action='/login'>"
+        "<label>Username<input name='username' required></label>"
+        "<label>Password<input type='password' name='password' required></label>"
+        "<button type='submit'>Log in</button></form>"
+        "<p><a href='/register'>Create a local account</a></p>",
+    )
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_form():
+    return _auth_page()
+
+
+@app.post("/login", response_class=HTMLResponse)
+def login(username: str = Form(...), password: str = Form(...)):
+    db = _auth_db()
+    row = db.execute("SELECT id, password_hash FROM users WHERE username=?",
+                     (username.strip(),)).fetchone()
+    db.close()
+    if row is None or not _password_matches(password, row[1]):
+        return _auth_page("Invalid username or password.")
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("nagare_session", _session_value(
+        row[0]), httponly=True, samesite="lax")
+    response.set_cookie("nagare_csrf", base64.urlsafe_b64encode(
+        os.urandom(24)).decode(), httponly=False, samesite="lax")
+    return response
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_form():
+    return _page(
+        "Create account",
+        "<h1>Create a local account</h1>"
+        "<form method='post' action='/register'>"
+        "<label>Username<input name='username' required></label>"
+        "<label>Password<input type='password' name='password' minlength='10' required></label>"
+        "<button type='submit'>Create account</button></form>",
+    )
+
+
+@app.post("/register", response_class=HTMLResponse)
+def register(username: str = Form(...), password: str = Form(...)):
+    if len(password) < 10 or not username.strip():
+        return _page("Account error", "<h1>Use a username and a 10-character password.</h1>")
+    user_id = hashlib.sha256(
+        f"{username}:{clock.time()}".encode()).hexdigest()[:24]
+    db = _auth_db()
+    try:
+        db.execute("INSERT INTO users(id, username, password_hash) VALUES (?,?,?)",
+                   (user_id, username.strip(), _password_hash(password)))
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.close()
+        return _page("Account error", "<h1>That username is already in use.</h1>")
+    db.close()
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie("nagare_session", _session_value(
+        user_id), httponly=True, samesite="lax")
+    response.set_cookie("nagare_csrf", base64.urlsafe_b64encode(
+        os.urandom(24)).decode(), httponly=False, samesite="lax")
+    return response
 
 
 def _pending_tasks(payload: dict, schedule: dict) -> list[dict]:
@@ -195,32 +382,35 @@ def _task_rows(day: str, titles: list[str], minutes: list[int],
             for index, task in enumerate(rows, 1)]
 
 
-def _run_schedule(payload: dict) -> tuple[str, RunState]:
+def _run_schedule(payload: dict, owner_id: str) -> tuple[str, RunState]:
     store = _store()
-    run_id = store.create_run("nagare")
+    run_id = store.create_run("nagare", meta={"owner_id": owner_id})
     store.append(run_id, "input", payload, produced_by="web_user")
     settings = load_settings()
     call = None
-    if os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model" and settings.api_key:
+    if (os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model"
+            and settings.api_key and _allow_model_call(owner_id)):
         from slice.llm import complete
         call = complete
     return run_id, runner.advance(store, run_id, build_flow(call), settings)
 
 
-def _focus_model_call(settings):
-    if os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model" and settings.api_key:
+def _focus_model_call(settings, owner_id: str | None = None):
+    if (os.environ.get("NAGARE_AGENT_MODE", "model").lower() == "model"
+            and settings.api_key
+            and (owner_id is None or _allow_model_call(owner_id))):
         from slice.llm import complete
         return complete
     return None
 
 
-def _run_focus(payload: dict) -> tuple[str, RunState]:
+def _run_focus(payload: dict, owner_id: str) -> tuple[str, RunState]:
     store = _store()
-    run_id = store.create_run("nagare_focus")
+    run_id = store.create_run("nagare_focus", meta={"owner_id": owner_id})
     store.append(run_id, "input", payload, produced_by="web_user")
     settings = load_settings()
     return run_id, runner.advance(
-        store, run_id, build_focus_flow(_focus_model_call(settings)), settings)
+        store, run_id, build_focus_flow(_focus_model_call(settings, owner_id)), settings)
 
 
 def _focus_html(run_id: str) -> str:
@@ -300,10 +490,12 @@ def _focus_html(run_id: str) -> str:
     )
 
 
-def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
+def _latest_schedule_queue(user_id: str) -> tuple[str | None, list[dict]]:
     store = _store()
     for run in store.list_runs(limit=100):
         if run["domain"] != "nagare":
+            continue
+        if not _owned_run(store, run["id"], user_id):
             continue
         payload = store.latest(run["id"], "input") or {}
         schedule = store.latest(run["id"], "proposed_schedule") or {}
@@ -311,6 +503,8 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
         consumed_minutes = {}
         for focus_run in store.list_runs(limit=100):
             if focus_run["domain"] != "nagare_focus":
+                continue
+            if not _owned_run(store, focus_run["id"], user_id):
                 continue
             focus_input = store.latest(focus_run["id"], "input") or {}
             if focus_input.get("context", {}).get("source_schedule_run_id") != run["id"]:
@@ -338,8 +532,9 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
 
 
 @app.get("/focus", response_class=HTMLResponse)
-def focus_form():
-    schedule_run_id, pending_tasks = _latest_schedule_queue()
+def focus_form(request: Request):
+    schedule_run_id, pending_tasks = _latest_schedule_queue(
+        request.state.user_id)
     if schedule_run_id is None:
         return _page(
             "Pending queue",
@@ -374,11 +569,12 @@ def focus_form():
 
 
 @app.post("/focus", response_class=HTMLResponse)
-def create_focus(selected_task_id: str = Form(...), schedule_run_id: str = Form(...)):
+def create_focus(request: Request, selected_task_id: str = Form(...), schedule_run_id: str = Form(...)):
     try:
         store = _store()
         if store.get_domain(schedule_run_id) != "nagare":
             raise ValueError("That schedule run is not a Nagare schedule.")
+        _require_owned(store, schedule_run_id, request.state.user_id)
         source = store.latest(schedule_run_id, "input") or {}
         schedule = store.latest(schedule_run_id, "proposed_schedule") or {}
         parsed = _pending_tasks(source, schedule)
@@ -386,7 +582,9 @@ def create_focus(selected_task_id: str = Form(...), schedule_run_id: str = Form(
             raise ValueError("Select a task from the read-only pending queue.")
         run_id, _ = _run_focus(
             {"tasks": parsed, "selected_task_id": selected_task_id,
-             "context": {"source_schedule_run_id": schedule_run_id}})
+             "context": {"source_schedule_run_id": schedule_run_id}},
+            request.state.user_id,
+        )
         return _page("Focus recommendation", _focus_html(run_id))
     except (ValueError, TypeError):
         return _page(
@@ -398,10 +596,12 @@ def create_focus(selected_task_id: str = Form(...), schedule_run_id: str = Form(
 
 
 @app.get("/focus/runs/{run_id}", response_class=HTMLResponse)
-def show_focus_run(run_id: str):
+def show_focus_run(request: Request, run_id: str):
     try:
-        if _store().get_domain(run_id) != "nagare_focus":
+        store = _store()
+        if store.get_domain(run_id) != "nagare_focus":
             raise KeyError(run_id)
+        _require_owned(store, run_id, request.state.user_id)
     except KeyError:
         return _page("Not found", "<h1>Not found</h1><p class='sub'>No such focus run.</p>")
     return _page("Focus recommendation", _focus_html(run_id))
@@ -409,6 +609,7 @@ def show_focus_run(run_id: str):
 
 @app.post("/focus/runs/{run_id}/outcome", response_class=HTMLResponse)
 def record_focus_outcome(
+    request: Request,
     run_id: str,
     status: str = Form(...),
     worked_minutes: int = Form(0),
@@ -416,6 +617,7 @@ def record_focus_outcome(
     store = _store()
     if store.get_domain(run_id) != "nagare_focus":
         return _page("Not found", "<h1>Not found</h1>")
+    _require_owned(store, run_id, request.state.user_id)
     if status not in {"completed", "partially_completed", "not_completed"}:
         return _page("Invalid outcome", "<h1>Invalid outcome</h1>")
     task_input = store.latest(run_id, "input") or {}
@@ -693,6 +895,7 @@ def schedule_form(timezone_name: str | None = None):
 
 @app.post("/schedule", response_class=HTMLResponse)
 def create_schedule(
+    request: Request,
     day: str = Form(...),
     available_start: str = Form(...),
     available_end: str = Form(...),
@@ -735,16 +938,17 @@ def create_schedule(
             "profile": profile.model_dump(mode="json"),
             "tasks": [task.model_dump(mode="json") for task in parsed_tasks],
             "existing_blocks": [],
-        })
+        }, request.state.user_id)
         return _page("Schedule ready", _schedule_html(run_id))
     except (ValueError, TypeError) as exc:
         return _page("Schedule input error", f"<h1>Could not build that schedule</h1><p class='error'>{html.escape(str(exc))}</p><p><a href='/schedule'>Back to schedule form</a></p>")
 
 
 @app.post("/runs/{run_id}/add-tasks", response_class=HTMLResponse)
-def add_tasks(run_id: str, tasks: str = Form(...)):
+def add_tasks(request: Request, run_id: str, tasks: str = Form(...)):
     store = _store()
     try:
+        _require_owned(store, run_id, request.state.user_id)
         payload = store.latest(run_id, "input")
         schedule = store.latest(run_id, "proposed_schedule")
         if payload is None or schedule is None:
@@ -765,7 +969,7 @@ def add_tasks(run_id: str, tasks: str = Form(...)):
         ]
         next_payload["existing_blocks"] = schedule.get("blocks", [])
         next_payload["added_task_ids"] = [item.id for item in additions]
-        new_run_id, _ = _run_schedule(next_payload)
+        new_run_id, _ = _run_schedule(next_payload, request.state.user_id)
         return _page("Tasks added", _schedule_html(new_run_id))
     except (ValueError, TypeError) as exc:
         return _page(
@@ -777,6 +981,7 @@ def add_tasks(run_id: str, tasks: str = Form(...)):
 
 @app.post("/runs/{run_id}/reschedule", response_class=HTMLResponse)
 def reschedule(
+    request: Request,
     run_id: str,
     task_id: str = Form(...),
     reason: str = Form(""),
@@ -784,6 +989,7 @@ def reschedule(
 ):
     store = _store()
     try:
+        _require_owned(store, run_id, request.state.user_id)
         payload = store.latest(run_id, "input")
         schedule = store.latest(run_id, "proposed_schedule")
         if payload is None or schedule is None:
@@ -802,26 +1008,32 @@ def reschedule(
         next_payload["rescheduled_task_id"] = task_id
         next_payload["rescheduled_from_run_id"] = run_id
         next_payload["previous_schedule"] = schedule
-        new_run_id, _ = _run_schedule(next_payload)
+        new_run_id, _ = _run_schedule(next_payload, request.state.user_id)
         return _page("Schedule updated", _schedule_html(new_run_id))
     except (KeyError, ValueError, TypeError) as exc:
         return _page("Reschedule error", f"<h1>Could not reschedule that task</h1><p class='error'>{html.escape(str(exc))}</p><p><a href='/schedule'>Create a new schedule</a></p>")
 
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
-def show_run(run_id: str):
+def show_run(request: Request, run_id: str):
     try:
-        _store().get_state(run_id)
+        store = _store()
+        _require_owned(store, run_id, request.state.user_id)
+        store.get_state(run_id)
     except KeyError:
         return _page("Not found", "<h1>Not found</h1><p class='sub'>No such schedule run.</p>")
     return _page("Schedule updated", _schedule_html(run_id))
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(request: Request):
     s = _store()
     callback.sweep(s)
-    open_qs = callback.pending(s)
+    user_id = request.state.user_id
+    open_qs = [
+        question for question in callback.pending(s)
+        if _owned_run(s, question.run_id, user_id)
+    ]
     if not open_qs:
         return _page("All clear", "<h1>All clear</h1><p class='sub'>NANI isn't stuck on anything right now.</p><p><a href='/schedule'>Build a schedule</a></p>")
     items = "".join(
@@ -856,10 +1068,13 @@ def index():
 
 
 @app.get("/q/{qid}", response_class=HTMLResponse)
-def show_question(qid: str):
-    question = _store().get_question(qid)
+def show_question(request: Request, qid: str):
+    store = _store()
+    question = store.get_question(qid)
+    if question is not None and not _owned_run(store, question.run_id, request.state.user_id):
+        question = None
     if question is None:
-        return _page("Not found", "<h1>Not found</h1><p class='sub'>No such question.</p>")
+        raise HTTPException(status_code=404, detail="Not found")
     if question.is_answered:
         return _page(
             "Already answered",
@@ -890,15 +1105,18 @@ def show_question(qid: str):
 
 
 @app.post("/q/{qid}")
-def submit(qid: str, answer: str = Form(...), who: str = Form("user")):
+def submit(request: Request, qid: str, answer: str = Form(...), who: str = Form("user")):
     text = (answer or "").strip()
     if not text:
         return RedirectResponse(f"/q/{qid}", status_code=303)
     store = _store()
-    run_id = callback.answer(store, qid, text, who=who)
+    question = store.get_question(qid)
+    if question is None or not _owned_run(store, question.run_id, request.state.user_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    run_id = callback.answer(store, qid, text, who=request.state.user_id)
     if run_id:
         current_settings = load_settings()
-        call = _focus_model_call(current_settings) if store.get_domain(
+        call = _focus_model_call(current_settings, request.state.user_id) if store.get_domain(
             run_id) == "nagare_focus" else None
         if store.get_domain(run_id) == "nagare_focus":
             runner.advance(store, run_id, build_focus_flow(

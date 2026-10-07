@@ -4,6 +4,17 @@ from slice.store import Store
 from web import expert
 
 
+def authenticated_client(username="alice"):
+    client = TestClient(expert.app)
+    response = client.post(
+        "/register",
+        data={"username": username, "password": "correct horse battery"},
+    )
+    assert response.status_code == 200
+    client.headers.update({"x-csrf-token": client.cookies["nagare_csrf"]})
+    return client
+
+
 def test_tasks_accept_no_deadline_value():
     tasks = expert._tasks(
         "2026-09-19",
@@ -26,7 +37,7 @@ def test_schedule_form_exposes_break_range_control():
 
 def test_structured_schedule_choices_create_tasks_and_protected_moments(tmp_path):
     expert.DB = str(tmp_path / "structured-form.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     response = client.post(
         "/schedule",
@@ -51,7 +62,7 @@ def test_structured_schedule_choices_create_tasks_and_protected_moments(tmp_path
 
 def test_schedule_page_accepts_legacy_tasks_and_adds_around_existing(tmp_path):
     expert.DB = str(tmp_path / "add-tasks.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
     response = client.post(
         "/schedule",
         data={
@@ -102,7 +113,7 @@ def test_pending_queue_keeps_remaining_minutes_for_partial_task():
 
 def test_schedule_form_generates_and_reschedules(tmp_path):
     expert.DB = str(tmp_path / "web.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     response = client.post(
         "/schedule",
@@ -139,7 +150,7 @@ def test_schedule_form_generates_and_reschedules(tmp_path):
 
 def test_schedule_does_not_spill_tasks_into_tomorrow(tmp_path):
     expert.DB = str(tmp_path / "single-day.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     response = client.post(
         "/schedule",
@@ -171,7 +182,7 @@ def test_schedule_does_not_spill_tasks_into_tomorrow(tmp_path):
 
 def test_focus_web_flow_accepts_selected_task_and_records_outcome(tmp_path):
     expert.DB = str(tmp_path / "focus-web.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     schedule_response = client.post(
         "/schedule",
@@ -257,7 +268,7 @@ def test_focus_web_flow_accepts_selected_task_and_records_outcome(tmp_path):
 
 def test_schedule_conflict_resumes_after_deferring_task(tmp_path):
     expert.DB = str(tmp_path / "conflict.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     response = client.post(
         "/schedule",
@@ -296,7 +307,7 @@ def test_schedule_conflict_resumes_after_deferring_task(tmp_path):
 
 def test_schedule_conflict_shortening_shows_updated_schedule(tmp_path):
     expert.DB = str(tmp_path / "shorten.db")
-    client = TestClient(expert.app)
+    client = authenticated_client()
 
     client.post(
         "/schedule",
@@ -324,3 +335,74 @@ def test_schedule_conflict_shortening_shows_updated_schedule(tmp_path):
     assert "Finish report" in updated.text
     assert store.get_state(run["id"]).value == "complete"
     assert store.latest(run["id"], "decision")["status"] == "scheduled"
+
+
+def test_logged_out_access_is_rejected(tmp_path):
+    expert.DB = str(tmp_path / "logged-out.db")
+    client = TestClient(expert.app)
+
+    assert client.get("/schedule").status_code == 401
+    assert client.post("/schedule", data={}).status_code == 401
+
+
+def test_cross_user_runs_questions_and_focus_history_are_isolated(tmp_path):
+    expert.DB = str(tmp_path / "owners.db")
+    alice = authenticated_client("alice")
+    bob = authenticated_client("bob")
+    response = alice.post(
+        "/schedule",
+        data={
+            "day": "2026-09-19", "available_start": "09:00",
+            "available_end": "10:00", "morning_energy": "5",
+            "afternoon_energy": "3", "evening_energy": "2",
+            "tasks": "Finish report | 120 | 5",
+        },
+    )
+    store = Store(expert.DB)
+    run = store.list_runs(limit=1)[0]
+    question = store.open_questions(run["id"])[0]
+
+    assert bob.get(f"/runs/{run['id']}").status_code == 404
+    assert bob.get(f"/q/{question.id}").status_code == 404
+    assert "Finish report" not in bob.get("/focus").text
+    assert bob.post(
+        f"/runs/{run['id']}/add-tasks", data={"tasks": "Other | 30 | 1"}
+    ).status_code == 404
+    assert response.status_code == 200
+
+
+def test_forged_identity_and_missing_csrf_are_rejected(tmp_path):
+    expert.DB = str(tmp_path / "forgery.db")
+    client = authenticated_client()
+    csrf = client.headers["x-csrf-token"]
+    client.headers.pop("x-csrf-token")
+    assert client.post("/schedule", data={}).status_code == 403
+    client.headers.update({"x-csrf-token": csrf})
+
+    client.post(
+        "/schedule",
+        data={
+            "day": "2026-09-19", "available_start": "09:00",
+            "available_end": "10:00", "morning_energy": "5",
+            "afternoon_energy": "3", "evening_energy": "2",
+            "tasks": "Finish report | 120 | 5",
+        },
+    )
+    store = Store(expert.DB)
+    run = store.list_runs(limit=1)[0]
+    question = store.open_questions(run["id"])[0]
+    client.post(
+        f"/q/{question.id}",
+        data={"answer": "move it", "who": "another-user"},
+    )
+    answer = store.latest(run["id"], "expert_answer")
+    assert answer["who"] != "another-user"
+    assert answer["who"] == store.meta(run["id"])["owner_id"]
+
+
+def test_model_call_limit_is_per_user():
+    expert._MODEL_CALLS.clear()
+    assert all(expert._allow_model_call("alice")
+               for _ in range(expert.MODEL_CALL_LIMIT))
+    assert not expert._allow_model_call("alice")
+    assert expert._allow_model_call("bob")
