@@ -275,8 +275,9 @@ def build_focus_flow(call=None):
             if lowered in {"accept", "accepted", "start", "yes", "y"}:
                 ctx.append("focus_decision", {
                            "task_id": task.id, "decision": "accepted", "answer": answer_text}, produced_by="user")
-                ctx.append("focus_outcome", {"task_id": task.id, "status": "started", "duration_minutes": ctx.latest(
-                    "focus_recommendation")["suggested_duration_minutes"]}, produced_by="user")
+                ctx.append("focus_outcome", {
+                    "task_id": task.id, "status": "started", "worked_minutes": 0,
+                }, produced_by="user")
                 _append_state(ctx, "working",
                               "The user accepted the recommended focus block.")
                 return RunState.COMPLETE
@@ -339,7 +340,7 @@ def build_focus_flow(call=None):
                 ctx.append("focus_outcome", {
                     "task_id": task.id,
                     "status": "started_breakdown",
-                    "duration_minutes": ctx.latest("breakdown_action")["estimated_minutes"],
+                    "worked_minutes": 0,
                     "breakdown": ctx.latest("breakdown_action"),
                 }, produced_by="user")
                 _append_state(ctx, "working",

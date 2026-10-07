@@ -31,6 +31,7 @@ from __future__ import annotations
 import html
 import os
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -277,10 +278,13 @@ def _focus_html(run_id: str) -> str:
         )
     outcome = store.latest(run_id, "focus_outcome")
     outcome_form = ""
-    if outcome and outcome.get("status", "").startswith("started"):
+    if outcome and outcome.get("status") in {
+        "started", "started_breakdown", "partially_completed"
+    }:
         outcome_form = (
             "<div class='card'><h2>When you finish</h2>"
             f"<form method='post' action='/focus/runs/{html.escape(run_id)}/outcome'>"
+            "<label>Minutes actually worked<input type='number' name='worked_minutes' min='0' required></label>"
             "<select name='status'><option value='completed'>Completed</option>"
             "<option value='partially_completed'>Partially completed</option>"
             "<option value='not_completed'>Not completed</option></select>"
@@ -316,9 +320,9 @@ def _latest_schedule_queue() -> tuple[str | None, list[dict]]:
             status = outcome.get("status")
             if status == "completed":
                 completed_ids.add(task_id)
-            elif status in {"started", "started_breakdown", "partially_completed"}:
+            elif status == "partially_completed":
                 consumed_minutes[task_id] = consumed_minutes.get(task_id, 0) + outcome.get(
-                    "duration_minutes", 0
+                    "worked_minutes", 0
                 )
 
         pending = []
@@ -404,18 +408,47 @@ def show_focus_run(run_id: str):
 
 
 @app.post("/focus/runs/{run_id}/outcome", response_class=HTMLResponse)
-def record_focus_outcome(run_id: str, status: str = Form(...)):
+def record_focus_outcome(
+    run_id: str,
+    status: str = Form(...),
+    worked_minutes: int = Form(0),
+):
     store = _store()
     if store.get_domain(run_id) != "nagare_focus":
         return _page("Not found", "<h1>Not found</h1>")
     if status not in {"completed", "partially_completed", "not_completed"}:
         return _page("Invalid outcome", "<h1>Invalid outcome</h1>")
-    task_id = (store.latest(run_id, "input") or {}).get("selected_task_id")
-    recommendation = store.latest(run_id, "focus_recommendation") or {}
+    task_input = store.latest(run_id, "input") or {}
+    task_id = task_input.get("selected_task_id")
+    task = next(
+        (item for item in task_input.get("tasks", []) if item.get("id") == task_id),
+        None,
+    )
+    remaining = int((task or {}).get("estimated_minutes", 0))
+    previous_work = sum(
+        int(item.payload.get("worked_minutes", 0))
+        for item in store.history(run_id, "focus_outcome")
+        if item.payload.get("status") == "partially_completed"
+    )
+    remaining = max(0, remaining - previous_work)
+    latest_outcome = store.latest(run_id, "focus_outcome")
+    if latest_outcome and (
+        latest_outcome.get("status") in {"completed", "not_completed"}
+        or (
+            latest_outcome.get("status") == "partially_completed"
+            and status == "partially_completed"
+        )
+    ):
+        return _page("Outcome already recorded", _focus_html(run_id))
+    if worked_minutes < 0 or worked_minutes > remaining:
+        return _page("Invalid outcome", "<h1>Minutes worked must be within the remaining task time.</h1>")
+    if status == "partially_completed" and worked_minutes == 0:
+        return _page("Invalid outcome", "<h1>Partial completion requires worked minutes.</h1>")
+    if status == "completed" and worked_minutes != remaining:
+        return _page("Invalid outcome", "<h1>Completed tasks must report all remaining minutes.</h1>")
     store.append(run_id, "focus_outcome", {
                  "task_id": task_id, "status": status,
-                 "duration_minutes": recommendation.get("suggested_duration_minutes", 0)
-                 if status in {"completed", "partially_completed"} else 0},
+                 "worked_minutes": worked_minutes},
                  produced_by="user")
     return _page("Outcome recorded", _focus_html(run_id))
 
@@ -608,13 +641,18 @@ def _page(title: str, body: str) -> HTMLResponse:
 
 
 @app.get("/schedule", response_class=HTMLResponse)
-def schedule_form():
+def schedule_form(timezone_name: str | None = None):
+    try:
+        selected_timezone = ZoneInfo(
+            timezone_name or os.environ.get("NAGARE_TIMEZONE", "UTC"))
+    except Exception:
+        selected_timezone = timezone.utc
     return _page(
         "Build your schedule",
         "<h1>Build your schedule</h1>"
         "<p class='sub'>Tell Nagare when you are available and what needs to get done.</p>"
         "<form method='post' action='/schedule'>"
-        f"<label>Date<input type='date' name='day' value='{datetime.now(timezone.utc).date().isoformat()}' required></label>"
+        f"<label>Date<input type='date' name='day' value='{datetime.now(selected_timezone).date().isoformat()}' required></label>"
         "<label>Available from<input type='time' name='available_start' value='09:00' required></label>"
         "<label>Available until<input type='time' name='available_end' value='21:00' required></label>"
         "<label>Break between tasks <output id='break-value'>15</output> min"
@@ -738,7 +776,12 @@ def add_tasks(run_id: str, tasks: str = Form(...)):
 
 
 @app.post("/runs/{run_id}/reschedule", response_class=HTMLResponse)
-def reschedule(run_id: str, task_id: str = Form(...), reason: str = Form("")):
+def reschedule(
+    run_id: str,
+    task_id: str = Form(...),
+    reason: str = Form(""),
+    occurred_at: str | None = Form(None),
+):
     store = _store()
     try:
         payload = store.latest(run_id, "input")
@@ -752,6 +795,10 @@ def reschedule(run_id: str, task_id: str = Form(...), reason: str = Form("")):
         next_payload["existing_blocks"] = schedule.get("blocks", [])
         next_payload["missed_task_id"] = task_id
         next_payload["reason"] = reason.strip() or "The task was interrupted."
+        next_payload["current_time"] = (
+            datetime.fromisoformat(occurred_at).isoformat()
+            if occurred_at else datetime.now(timezone.utc).isoformat()
+        )
         next_payload["rescheduled_task_id"] = task_id
         next_payload["rescheduled_from_run_id"] = run_id
         next_payload["previous_schedule"] = schedule

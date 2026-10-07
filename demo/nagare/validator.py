@@ -12,8 +12,17 @@ def validate_schedule(
     tasks,
     profile,
     locked_blocks,
+    approved_deferred_task_ids=None,
+    approved_pending_minutes=None,
+    current_time=None,
 ):
     conflicts = []
+    if current_time is not None and (
+        current_time.tzinfo is None or current_time.utcoffset() is None
+    ):
+        raise ValueError("current_time must be timezone-aware")
+    approved_deferred_task_ids = set(approved_deferred_task_ids or [])
+    approved_pending_minutes = approved_pending_minutes or {}
 
     def available_minutes_before_deadline(task):
         if task.deadline is None:
@@ -57,14 +66,26 @@ def validate_schedule(
             )
 
     for task in tasks:
-        if task.id in getattr(schedule, "deferred_task_ids", []):
+        if task.id in approved_deferred_task_ids:
             continue
         if task.id in scheduled_task_ids:
             remaining = task.estimated_duration - \
                 scheduled_minutes.get(task.id, 0)
-            accepted_pending = getattr(
-                schedule, "pending_minutes", {}).get(task.id, 0)
-            if remaining > 0 and accepted_pending != remaining:
+            accepted_pending = approved_pending_minutes.get(task.id)
+            if remaining < 0:
+                conflicts.append(
+                    Conflict(
+                        task_id=task.id,
+                        conflict_type="duration",
+                        severity=5,
+                        resolvable=False,
+                        explanation=(
+                            f"Task '{task.title}' has more than its estimated "
+                            "duration scheduled."
+                        ),
+                    )
+                )
+            elif remaining > 0 and accepted_pending != remaining:
                 conflicts.append(
                     Conflict(
                         task_id=task.id,
@@ -74,7 +95,8 @@ def validate_schedule(
                         explanation=(
                             f"Task '{task.title}' has only "
                             f"{scheduled_minutes[task.id]} of {task.estimated_duration} "
-                            f"minutes scheduled; {remaining} remain pending."
+                            f"minutes scheduled; {remaining} remain pending "
+                            "without a human-approved allowance."
                         ),
                     )
                 )
@@ -131,7 +153,48 @@ def validate_schedule(
         task = by_id.get(block.task_id)
 
         if task is None:
+            conflicts.append(
+                Conflict(
+                    task_id=block.task_id,
+                    conflicting_block_id=block.id,
+                    conflict_type="unresolved_constraint",
+                    severity=5,
+                    resolvable=False,
+                    explanation="The schedule contains a block for an unknown task.",
+                )
+            )
             continue
+
+        duration = int((block.end - block.start).total_seconds() // 60)
+        if current_time is not None:
+            comparison_time = current_time
+            if block.start.tzinfo is None:
+                comparison_time = current_time.replace(tzinfo=None)
+            if block.start < comparison_time:
+                conflicts.append(
+                    Conflict(
+                        task_id=task.id,
+                        conflicting_block_id=block.id,
+                        conflict_type="availability",
+                        severity=5,
+                        resolvable=True,
+                        explanation="A live schedule cannot place work before the current time.",
+                    )
+                )
+        if task.max_continuous_duration and duration > task.max_continuous_duration:
+            conflicts.append(
+                Conflict(
+                    task_id=task.id,
+                    conflicting_block_id=block.id,
+                    conflict_type="break",
+                    severity=4,
+                    resolvable=True,
+                    explanation=(
+                        f"Task '{task.title}' requires a break within "
+                        f"{task.max_continuous_duration} minutes."
+                    ),
+                )
+            )
 
         # Protected time
         if _protected(
@@ -244,9 +307,29 @@ def validate_schedule(
                 block.end,
                 other,
             ):
-                continue
-
-            if block.task_id == other.task_id:
+                if (
+                    block.task_id == other.task_id
+                    and task.break_required
+                    and timedelta(0) <= other.start - block.end
+                    and (
+                        other.start == block.end
+                        or other.start - block.end
+                        < timedelta(minutes=profile.task_break_minutes)
+                    )
+                ):
+                    conflicts.append(
+                        Conflict(
+                            task_id=task.id,
+                            conflicting_block_id=other.id,
+                            conflict_type="break",
+                            severity=4,
+                            resolvable=True,
+                            explanation=(
+                                f"Task '{task.title}' requires a break between "
+                                "consecutive work blocks."
+                            ),
+                        )
+                    )
                 continue
 
             conflicts.append(

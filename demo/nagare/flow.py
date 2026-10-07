@@ -6,7 +6,7 @@ and the runner supplies the bounded back-edge for revisions and escalation.
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from slice import callback
@@ -193,6 +193,10 @@ def build_flow(call=None):
         tasks, profile, existing = _models(ctx)
         missed_task_id = payload.get(
             "missed_task_id") or payload.get("block_id")
+        current_time = None
+        if missed_task_id and (payload.get("current_time") or payload.get("occurred_at")):
+            current_time = datetime.fromisoformat(
+                payload.get("current_time") or payload.get("occurred_at"))
 
         # Explicit human actions are authoritative in both AI and offline mode.
         # Do not ask the model to reinterpret a button the user already chose.
@@ -234,6 +238,11 @@ def build_flow(call=None):
                     "proposed_schedule",
                     split_schedule.model_dump(mode="json"),
                     produced_by="planner:human_fragmentation",
+                )
+                ctx.append(
+                    "approved_allowance",
+                    {"pending_minutes": fragment.pending_minutes},
+                    produced_by="user_decision",
                 )
                 return RunState.GATING
 
@@ -277,6 +286,12 @@ def build_flow(call=None):
                     "proposed_schedule",
                     rebalanced.model_dump(mode="json"),
                     produced_by="planner:human_rebalance",
+                )
+                ctx.append(
+                    "approved_allowance",
+                    {"deferred_task_ids": [deferred.id],
+                     "pending_minutes": {deferred.id: deferred.estimated_duration}},
+                    produced_by="user_decision",
                 )
                 return RunState.GATING
 
@@ -350,6 +365,7 @@ def build_flow(call=None):
                     tasks,
                     profile,
                     excluded_block_id=missed_task.id,
+                    current_time=current_time,
                 )
             return baseline_schedule(
                 tasks,
@@ -385,6 +401,7 @@ def build_flow(call=None):
                 tasks,
                 profile,
                 [block for block in existing if block.locked],
+                current_time=current_time,
             )
             proposed_task_ids = {
                 block.task_id
@@ -442,9 +459,23 @@ def build_flow(call=None):
         tasks, profile, existing = _models(ctx)
         schedule = ProposedSchedule.model_validate(proposed)
         locked_blocks = [block for block in existing if block.locked]
+        approved_deferred_task_ids = set()
+        approved_pending_minutes = {}
+        for allowance in ctx.history("approved_allowance"):
+            approved_deferred_task_ids.update(
+                allowance.payload.get("deferred_task_ids", []))
+            approved_pending_minutes.update(
+                allowance.payload.get("pending_minutes", {}))
 
         # Rule-based validation ensures the AI didn't hallucinate!
-        validation = validate_schedule(schedule, tasks, profile, locked_blocks)
+        validation = validate_schedule(
+            schedule,
+            tasks,
+            profile,
+            locked_blocks,
+            approved_deferred_task_ids=approved_deferred_task_ids,
+            approved_pending_minutes=approved_pending_minutes,
+        )
 
         ctx.append(
             "validation",

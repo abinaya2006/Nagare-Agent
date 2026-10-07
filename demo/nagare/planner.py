@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from .schema import (
     ProposedSchedule,
@@ -66,8 +66,22 @@ def _fits(task, start, end, profile, blocks):
     return True
 
 
-def candidate_slots(task, duration, profile, blocks):
+def _require_aware(value, name):
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+
+
+def _at_or_after(value, current_time):
+    if value.tzinfo is None:
+        return value >= current_time.replace(tzinfo=None)
+    return value >= current_time
+
+
+def candidate_slots(task, duration, profile, blocks, current_time=None):
     slots = []
+
+    if current_time is not None:
+        _require_aware(current_time, "current_time")
 
     length = timedelta(minutes=duration)
 
@@ -86,7 +100,7 @@ def candidate_slots(task, duration, profile, blocks):
         while cursor + length <= window.end:
             end = cursor + length
 
-            if _fits(
+            if (current_time is None or _at_or_after(cursor, current_time)) and _fits(
                 task,
                 cursor,
                 end,
@@ -228,6 +242,7 @@ def reschedule_task(
     tasks,
     profile,
     excluded_block_id=None,
+    current_time=None,
 ):
     """
     Try to place the missed task into a feasible slot.
@@ -255,11 +270,15 @@ def reschedule_task(
 
         kept.append(block)
 
+    if current_time is not None:
+        _require_aware(current_time, "current_time")
+
     slots = candidate_slots(
         task,
         remaining_minutes,
         profile,
         kept,
+        current_time=current_time,
     )
 
     if removed:

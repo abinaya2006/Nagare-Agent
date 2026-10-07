@@ -1,5 +1,5 @@
 """Focused tests for Nagare's deterministic scheduling core."""
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -55,6 +55,21 @@ def profile(*available: TimeWindow) -> UserScheduleProfile:
         ),
         commute_windows=[],
     )
+
+
+def aware_profile(*available: TimeWindow) -> UserScheduleProfile:
+    result = profile(*available)
+    result.preferred_work_periods = [
+        TimeWindow(start=item.start, end=item.end)
+        for item in available
+    ]
+    result.sleep_window = TimeWindow(
+        start=DAY.replace(hour=23, tzinfo=timezone.utc),
+        end=DAY.replace(hour=23, tzinfo=timezone.utc) +
+        __import__("datetime").timedelta(hours=8),
+    )
+    result.circadian_profile.peak_periods = []
+    return result
 
 
 def task(task_id: str = "ml", duration: int = 120, **overrides) -> Task:
@@ -178,6 +193,46 @@ def test_reschedule_moves_task_into_a_future_feasible_slot():
     assert moved.start == DAY.replace(hour=11)
     assert moved.end == DAY.replace(hour=13)
     assert moved.id == "block_ml"
+
+
+def test_live_reschedule_never_uses_a_slot_before_current_time():
+    start = DAY.replace(hour=9, tzinfo=timezone.utc)
+    end = DAY.replace(hour=17, tzinfo=timezone.utc)
+    current = DAY.replace(hour=16, tzinfo=timezone.utc)
+    user_profile = aware_profile(TimeWindow(start=start, end=end))
+    original = ScheduleBlock(
+        id="block_ml", task_id="ml", start=start, end=DAY.replace(hour=11, tzinfo=timezone.utc),
+        block_type="task",
+    )
+
+    schedule = reschedule_task(
+        task(duration=60), 60, [original], [task(duration=60)], user_profile,
+        excluded_block_id=original.id, current_time=current,
+    )
+
+    moved = next(item for item in schedule.blocks if item.task_id == "ml")
+    assert moved.start >= current
+
+
+def test_live_reschedule_returns_no_slot_when_the_future_is_full():
+    start = DAY.replace(hour=9, tzinfo=timezone.utc)
+    current = DAY.replace(hour=16, tzinfo=timezone.utc)
+    user_profile = aware_profile(TimeWindow(start=start, end=current))
+
+    schedule = reschedule_task(
+        task(duration=60), 60, [], [task(duration=60)], user_profile,
+        current_time=current,
+    )
+
+    assert not any(item.task_id == "ml" for item in schedule.blocks)
+
+
+def test_live_time_must_be_timezone_aware():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        reschedule_task(
+            task(), 60, [], [task()], profile(window(9, 17)),
+            current_time=DAY.replace(hour=16),
+        )
 
 
 def test_flow_reschedule_replaces_missed_block_instead_of_duplicating(tmp_path):
@@ -315,6 +370,90 @@ def test_validator_blocks_overlapping_tasks():
     assert result.status == "BLOCK"
     assert any(conflict.conflict_type ==
                "time_overlap" for conflict in result.conflicts)
+
+
+def test_validator_does_not_trust_self_deferral_or_pending_minutes():
+    user_profile = profile(window(9, 12))
+    scheduled = ProposedSchedule(
+        blocks=[block("ml", 9, 10)],
+        pending_minutes={"ml": 60},
+        deferred_task_ids=["ml"],
+    )
+
+    result = validate_schedule(
+        scheduled, [task(duration=120)], user_profile, [])
+
+    assert result.status == "BLOCK"
+    assert any(conflict.conflict_type ==
+               "duration" for conflict in result.conflicts)
+
+
+def test_validator_accepts_explicit_human_allowances():
+    user_profile = profile(window(9, 12))
+    scheduled = ProposedSchedule(
+        blocks=[block("ml", 9, 10)],
+        pending_minutes={"ml": 60},
+        deferred_task_ids=["ml"],
+    )
+
+    result = validate_schedule(
+        scheduled,
+        [task(duration=120)],
+        user_profile,
+        [],
+        approved_pending_minutes={"ml": 60},
+    )
+
+    assert result.status == "PASS"
+
+
+def test_validator_rejects_unknown_tasks_same_task_overlap_and_overallocation():
+    user_profile = profile(window(9, 13))
+    scheduled = type("Schedule", (), {"blocks": [
+        block("one", 9, 11, task_id="ml"),
+        block("two", 10, 12, task_id="ml"),
+        block("unknown", 12, 13, task_id="ghost"),
+    ]})()
+
+    result = validate_schedule(
+        scheduled, [task(duration=120)], user_profile, [])
+
+    assert result.status == "BLOCK"
+    assert any(conflict.conflict_type ==
+               "time_overlap" for conflict in result.conflicts)
+    assert any(conflict.conflict_type ==
+               "unresolved_constraint" for conflict in result.conflicts)
+    assert any(conflict.conflict_type ==
+               "duration" for conflict in result.conflicts)
+
+
+def test_validator_rejects_missing_required_break():
+    user_profile = profile(window(9, 13))
+    scheduled = ProposedSchedule(blocks=[block("ml", 9, 11)])
+    constrained = task(
+        duration=120, max_continuous_duration=60, break_required=True)
+
+    result = validate_schedule(scheduled, [constrained], user_profile, [])
+
+    assert result.status == "BLOCK"
+    assert any(conflict.conflict_type ==
+               "break" for conflict in result.conflicts)
+
+
+def test_validator_rejects_missing_break_between_task_blocks():
+    user_profile = profile(window(9, 13))
+    scheduled = ProposedSchedule(blocks=[
+        block("ml-1", 9, 10, task_id="ml"),
+        block("ml-2", 10, 11, task_id="ml"),
+    ])
+    constrained = task(
+        duration=120, break_required=True, max_continuous_duration=60)
+
+    result = validate_schedule(scheduled, [constrained], user_profile, [])
+
+    assert result.status == "BLOCK"
+    assert any(conflict.conflict_type ==
+               "break" for conflict in result.conflicts)
 
 
 def test_validator_detects_changed_locked_block():
@@ -497,7 +636,13 @@ def test_fragmented_task_can_pass_before_deadline():
         preferred_fragment_duration=60,
     )
     schedule = fragment_task(urgent, user_profile)
-    result = validate_schedule(schedule, [urgent], user_profile, [])
+    result = validate_schedule(
+        schedule,
+        [urgent],
+        user_profile,
+        [],
+        approved_pending_minutes={urgent.id: 30},
+    )
 
     assert len(schedule.blocks) == 3
     assert result.status == "PASS"
@@ -512,7 +657,13 @@ def test_fragmented_task_keeps_unplaced_remainder_pending():
     )
 
     schedule = fragment_task(urgent, user_profile)
-    result = validate_schedule(schedule, [urgent], user_profile, [])
+    result = validate_schedule(
+        schedule,
+        [urgent],
+        user_profile,
+        [],
+        approved_pending_minutes={urgent.id: 30},
+    )
 
     assert sum(
         int((item.end - item.start).total_seconds() // 60)

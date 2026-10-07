@@ -125,7 +125,8 @@ def test_schedule_form_generates_and_reschedules(tmp_path):
     run = store.list_runs(limit=1)[0]
     rescheduled = client.post(
         f"/runs/{run['id']}/reschedule",
-        data={"task_id": "task-001", "reason": "Meeting ran late"},
+        data={"task_id": "task-001", "reason": "Meeting ran late",
+              "occurred_at": "2026-09-19T10:00:00+00:00"},
     )
 
     assert rescheduled.status_code == 200
@@ -226,11 +227,25 @@ def test_focus_web_flow_accepts_selected_task_and_records_outcome(tmp_path):
     assert store.latest(run["id"], "focus_outcome")["status"] == "started"
     remaining_queue = client.get("/focus")
     assert remaining_queue.status_code == 200
-    assert "60 min" in remaining_queue.text
+    assert "90 min" in remaining_queue.text
+
+    partial = client.post(
+        f"/focus/runs/{run['id']}/outcome",
+        data={"status": "partially_completed", "worked_minutes": "10"},
+    )
+    assert partial.status_code == 200
+    assert "80 min" in client.get("/focus").text
+
+    duplicate = client.post(
+        f"/focus/runs/{run['id']}/outcome",
+        data={"status": "partially_completed", "worked_minutes": "10"},
+    )
+    assert duplicate.status_code == 200
+    assert "80 min" in client.get("/focus").text
 
     completed = client.post(
         f"/focus/runs/{run['id']}/outcome",
-        data={"status": "completed"},
+        data={"status": "completed", "worked_minutes": "80"},
     )
     assert completed.status_code == 200
     assert store.latest(run["id"], "focus_outcome")["status"] == "completed"
